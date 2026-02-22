@@ -41,12 +41,18 @@ import numpy as np
 
 PHONETIC_SIGNATURES = {
     # Vowels — open, sustained, voiced, approximant
+    # Place axis encodes vowel harmony: back(+) / neutral(0) / front(-)
     #          [aper, dur,  voic, place, mann, freq]
     'a': [+1.0, +1.0, +1.0,  0.0, +1.0, -0.4],  # open, central, low-mid
-    'e': [+0.5, +0.8, +1.0, -0.2, +1.0,  0.0],  # mid-front
-    'i': [+0.0, +0.7, +1.0, -0.4, +1.0, +0.6],  # close-front, high
+    'e': [+0.5, +0.8, +1.0, -0.2, +1.0,  0.0],  # mid-front (neutral in Finnish)
+    'i': [+0.0, +0.7, +1.0, -0.4, +1.0, +0.6],  # close-front, high (neutral in Finnish)
     'o': [+0.6, +0.8, +1.0, +0.2, +1.0, -0.5],  # mid-back, low
     'u': [+0.0, +0.7, +1.0, +0.4, +1.0, -0.6],  # close-back, lowest
+
+    # Finnish front vowels — same mouth shape as back counterpart, front place
+    '\u00e4': [+1.0, +1.0, +1.0, -0.6, +1.0, +0.1],  # ä: open front (counterpart of a)
+    '\u00f6': [+0.6, +0.8, +1.0, -0.4, +1.0, -0.1],  # ö: mid front rounded (counterpart of o)
+    '\u00e5': [+0.9, +0.9, +1.0, +0.3, +1.0, -0.5],  # å: back open rounded (Swedish loans)
 
     # Plosives — closed, impulse, stop
     #          [aper, dur,  voic, place, mann, freq]
@@ -227,6 +233,36 @@ def verify_phonetic_structure(codebook):
     print("\nNasals m-n (should be >0.4):")
     sim = cos_sim(codebook['m'], codebook['n'])
     print(f"  m-n: {sim:.3f}")
+
+    # Finnish vowel harmony pairs (if present)
+    if '\u00e4' in codebook:
+        print("\nFinnish vowel harmony (back/front pairs, should be >0.3):")
+        fi_pairs = [('a', '\u00e4'), ('o', '\u00f6')]
+        for back, front in fi_pairs:
+            if front in codebook:
+                sim = cos_sim(codebook[back], codebook[front])
+                print(f"  {back}-{front}: {sim:.3f} (same shape, different place)")
+
+        print("\nFinnish harmony groups (within-group, should be >0.2):")
+        back_vowels = ['a', 'o', 'u']
+        front_vowels = ['\u00e4', '\u00f6']
+        for i in range(len(back_vowels)):
+            for j in range(i + 1, len(back_vowels)):
+                a, b = back_vowels[i], back_vowels[j]
+                sim = cos_sim(codebook[a], codebook[b])
+                print(f"  {a}-{b}: {sim:.3f} (back group)")
+        for i in range(len(front_vowels)):
+            for j in range(i + 1, len(front_vowels)):
+                a, b = front_vowels[i], front_vowels[j]
+                sim = cos_sim(codebook[a], codebook[b])
+                print(f"  {a}-{b}: {sim:.3f} (front group)")
+
+        print("\nFinnish cross-harmony (back vs front, should be LOW):")
+        for bv in ['a', 'o']:
+            for fv in ['\u00e4', '\u00f6']:
+                if bv != fv and fv in codebook:
+                    sim = cos_sim(codebook[bv], codebook[fv])
+                    print(f"  {bv}-{fv}: {sim:.3f}")
 
     print()
 

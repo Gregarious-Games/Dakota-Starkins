@@ -39,21 +39,34 @@ CONTEXT_WINDOW = 8
 SWARM_STEPS = 3
 LEARNING_RATE = 0.1
 
-# 65 characters: lowercase + digits + punctuation + space + newline
-_RAW_ALPHABET = (
+# Base alphabet: lowercase + digits + punctuation + space + newline
+_RAW_ALPHABET_EN = (
     "abcdefghijklmnopqrstuvwxyz"
     "0123456789"
     " \n.,;:!?'-"
     "()[]@#$%&*+=/_"
 )
-# Deduplicate preserving order, then pad/trim to 65
-_seen = set()
-_deduped = []
-for _c in _RAW_ALPHABET:
-    if _c not in _seen:
-        _seen.add(_c)
-        _deduped.append(_c)
-ALPHABET = ''.join(_deduped[:65])
+# Finnish extends with ä, ö, å
+_RAW_ALPHABET_FI = (
+    "abcdefghijklmnopqrstuvwxyz"
+    "\u00e4\u00f6\u00e5"  # ä, ö, å
+    "0123456789"
+    " \n.,;:!?'-"
+    "()[]@#$%&*+=/_"
+)
+
+def _build_alphabet(raw):
+    seen = set()
+    deduped = []
+    for c in raw:
+        if c not in seen:
+            seen.add(c)
+            deduped.append(c)
+    return ''.join(deduped)
+
+ALPHABET_EN = _build_alphabet(_RAW_ALPHABET_EN)
+ALPHABET_FI = _build_alphabet(_RAW_ALPHABET_FI)
+ALPHABET = ALPHABET_EN  # default
 NUM_CHARS = len(ALPHABET)
 
 
@@ -70,15 +83,17 @@ class HDCTokenizer:
     A text window is encoded as: bundle(bind(char_i, pos_i) for i in window).
     """
 
-    def __init__(self, dim=D, context_window=CONTEXT_WINDOW, seed=42, mode="random"):
+    def __init__(self, dim=D, context_window=CONTEXT_WINDOW, seed=42,
+                 mode="random", language="english"):
         self.dim = dim
         self.context_window = context_window
         self.mode = mode
+        self.language = language
         self.rng = np.random.default_rng(seed)
         self.hdc = HDCPrimitives(dim=dim, rng=self.rng)
 
-        # Character codebook
-        self.chars = ALPHABET
+        # Select alphabet for language
+        self.chars = ALPHABET_FI if language == "finnish" else ALPHABET_EN
         self.char_to_idx = {c: i for i, c in enumerate(self.chars)}
         self.idx_to_char = {i: c for i, c in enumerate(self.chars)}
 
@@ -198,7 +213,7 @@ class SwarmLanguageModel:
     def __init__(self, n_nodes=N_NODES, context_window=CONTEXT_WINDOW,
                  swarm_steps=SWARM_STEPS, dim=D,
                  output_strategy="centroid", seed=42,
-                 codebook_mode="random"):
+                 codebook_mode="random", language="english"):
         self.n_nodes = n_nodes
         self.context_window = context_window
         self.swarm_steps = swarm_steps
@@ -206,10 +221,12 @@ class SwarmLanguageModel:
         self.output_strategy = output_strategy
         self.seed = seed
         self.codebook_mode = codebook_mode
+        self.language = language
 
         # Tokenizer
         self.tokenizer = HDCTokenizer(dim=dim, context_window=context_window,
-                                      seed=seed, mode=codebook_mode)
+                                      seed=seed, mode=codebook_mode,
+                                      language=language)
 
         # Create DennisNodes
         self.nodes = []
@@ -436,42 +453,71 @@ class SwarmLanguageModel:
 
         return ''.join(generated[len(text):])
 
-    def train_shakespeare(self, filepath=None, max_chars=50000):
-        """
-        Train on Shakespeare's text corpus.
+    def _load_corpus(self, language=None, filepath=None, max_chars=50000):
+        """Load training corpus for the given language."""
+        lang = language or self.language
+        base_dir = os.path.dirname(os.path.abspath(__file__))
 
-        Downloads tiny_shakespeare.txt if not found locally.
-        Reports accuracy curve every 1000 steps.
-
-        Returns: dict with training history and generated sample
-        """
-        # Try to load corpus
-        if filepath is None:
-            filepath = os.path.join(os.path.dirname(__file__), "tiny_shakespeare.txt")
-
-        if not os.path.exists(filepath):
-            print(f"  Downloading tiny_shakespeare.txt...")
-            try:
-                import urllib.request
-                url = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
-                urllib.request.urlretrieve(url, filepath)
-                print(f"  Downloaded to {filepath}")
-            except Exception as e:
-                print(f"  Download failed: {e}")
-                print(f"  Generating synthetic training data instead...")
-                # Fallback: generate repetitive English-like text
-                corpus = ("to be or not to be that is the question "
-                         "whether tis nobler in the mind to suffer "
-                         "the slings and arrows of outrageous fortune "
-                         "or to take arms against a sea of troubles ") * 500
-                with open(filepath, 'w') as f:
-                    f.write(corpus)
+        if lang == "finnish":
+            if filepath is None:
+                filepath = os.path.join(base_dir, "kalevala.txt")
+            if not os.path.exists(filepath):
+                print(f"  Downloading Kalevala from Project Gutenberg...")
+                try:
+                    import urllib.request
+                    url = "https://www.gutenberg.org/cache/epub/7000/pg7000.txt"
+                    urllib.request.urlretrieve(url, filepath)
+                    print(f"  Downloaded to {filepath}")
+                except Exception as e:
+                    print(f"  Download failed: {e}")
+                    print(f"  Using synthetic Finnish text...")
+                    corpus = (
+                        "vaka vanha v\u00e4in\u00e4m\u00f6inen "
+                        "tietäjä iän ikuinen "
+                        "lähti luota äitinsä "
+                        "meni maata vierahille "
+                        "tuonne kylmähän kylähän "
+                        "pimeähän pohjolahan "
+                        "siellä viipyi vuotta kolme "
+                        "ei tullut kesän tullen "
+                        "ei talven palatessa "
+                        "jo tuosta isä itkevi "
+                        "äiti murehti muretti "
+                        "sisko silmät kyynelissä "
+                        "veli veikon kaipajana "
+                    ) * 300
+                    with open(filepath, 'w', encoding='utf-8') as f:
+                        f.write(corpus)
+        else:
+            if filepath is None:
+                filepath = os.path.join(base_dir, "tiny_shakespeare.txt")
+            if not os.path.exists(filepath):
+                print(f"  Downloading tiny_shakespeare.txt...")
+                try:
+                    import urllib.request
+                    url = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
+                    urllib.request.urlretrieve(url, filepath)
+                    print(f"  Downloaded to {filepath}")
+                except Exception as e:
+                    print(f"  Download failed: {e}")
+                    print(f"  Using synthetic English text...")
+                    corpus = ("to be or not to be that is the question "
+                             "whether tis nobler in the mind to suffer "
+                             "the slings and arrows of outrageous fortune "
+                             "or to take arms against a sea of troubles ") * 500
+                    with open(filepath, 'w', encoding='utf-8') as f:
+                        f.write(corpus)
 
         with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
             corpus = f.read()
 
         corpus = corpus[:max_chars].lower()
-        print(f"  Corpus: {len(corpus)} chars")
+        return corpus
+
+    def train_shakespeare(self, filepath=None, max_chars=50000):
+        """Train on Shakespeare or Finnish corpus depending on language."""
+        corpus = self._load_corpus(filepath=filepath, max_chars=max_chars)
+        print(f"  Corpus: {len(corpus)} chars ({self.language})")
 
         # Training loop
         history = []
@@ -513,11 +559,17 @@ class SwarmLanguageModel:
         final_acc = self.correct_predictions / max(1, self.total_predictions)
         print(f"\n  Training complete: {n_steps} steps in {elapsed:.1f}s")
         print(f"  Final accuracy: {final_acc:.4f} ({final_acc*100:.1f}%)")
-        print(f"  Random baseline: {1/NUM_CHARS*100:.1f}%")
+        n_chars = len(self.tokenizer.chars)
+        print(f"  Random baseline: {1/n_chars*100:.1f}%")
 
-        # Generate sample
-        print(f"\n  Generating 200 chars from seed 'to be or '...")
-        sample = self.generate("to be or ", length=200)
+        # Generate sample with language-appropriate seed
+        if self.language == "finnish":
+            seed = "vaka van"  # "vaka vanha" = "old steady" (Kalevala opening)
+        else:
+            seed = "to be or"
+        seed = seed[:self.context_window]
+        print(f"\n  Generating 200 chars from seed '{seed}'...")
+        sample = self.generate(seed, length=200)
         print(f"  Generated: {repr(sample[:200])}")
 
         return {
@@ -640,17 +692,19 @@ def test_pattern_learning():
     return passed
 
 
-def test_shakespeare(max_chars=50000, codebook_mode="random"):
-    """Test 4: Train on Shakespeare, report accuracy curve + generate."""
+def test_shakespeare(max_chars=50000, codebook_mode="random", language="english"):
+    """Test 4: Train on corpus, report accuracy curve + generate."""
+    lang_label = language.capitalize()
     print("\n" + "="*60)
-    print(f"  TEST 4: Shakespeare Training (codebook={codebook_mode})")
+    print(f"  TEST 4: {lang_label} Training (codebook={codebook_mode})")
     print("="*60)
 
     model = SwarmLanguageModel(n_nodes=N_NODES, swarm_steps=SWARM_STEPS,
-                               codebook_mode=codebook_mode)
+                               codebook_mode=codebook_mode, language=language)
     results = model.train_shakespeare(max_chars=max_chars)
 
-    random_baseline = 1.0 / NUM_CHARS
+    n_chars = len(model.tokenizer.chars)
+    random_baseline = 1.0 / n_chars
     passed = results["final_accuracy"] > random_baseline
 
     if passed:
@@ -659,6 +713,31 @@ def test_shakespeare(max_chars=50000, codebook_mode="random"):
         print(f"  FAIL: Final accuracy {results['final_accuracy']:.3f} <= baseline {random_baseline:.3f}")
 
     return passed, results
+
+
+def _print_comparison(title, random_results, qams_results, language="english"):
+    """Print formatted comparison between random and QAMS results."""
+    print("\n" + "="*70)
+    print(f"  {title} ({language.capitalize()})")
+    print("="*70)
+    print(f"  Random final accuracy:  {random_results['final_accuracy']:.4f} ({random_results['final_accuracy']*100:.1f}%)")
+    print(f"  QAMS final accuracy:    {qams_results['final_accuracy']:.4f} ({qams_results['final_accuracy']*100:.1f}%)")
+    delta = qams_results['final_accuracy'] - random_results['final_accuracy']
+    if delta > 0:
+        print(f"  QAMS advantage:         +{delta:.4f} ({delta*100:.1f}%)")
+    else:
+        print(f"  Random advantage:       +{-delta:.4f} ({-delta*100:.1f}%)")
+
+    if random_results['history'] and qams_results['history']:
+        r_early = random_results['history'][0]['accuracy']
+        q_early = qams_results['history'][0]['accuracy']
+        print(f"  Random first window:    {r_early:.4f}")
+        print(f"  QAMS first window:      {q_early:.4f}")
+        if q_early > r_early:
+            print(f"  QAMS learns faster:     +{q_early - r_early:.4f} at step 1000")
+
+    print(f"\n  Random sample: {repr(random_results['generated_sample'][:100])}")
+    print(f"  QAMS sample:   {repr(qams_results['generated_sample'][:100])}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -674,11 +753,14 @@ if __name__ == "__main__":
     # Parse CLI args
     codebook_mode = "random"
     max_chars = 50000
+    language = "english"
     for arg in sys.argv:
         if arg.startswith("--codebook="):
             codebook_mode = arg.split("=")[1]
         if arg.startswith("--max-chars="):
             max_chars = int(arg.split("=")[1])
+        if arg.startswith("--language="):
+            language = arg.split("=")[1]
 
     results = {}
 
@@ -691,47 +773,70 @@ if __name__ == "__main__":
     # Test 3: Pattern learning
     results["pattern"] = test_pattern_learning()
 
-    # Test 4: Shakespeare (optional — slow)
+    # Test 4: Corpus training (optional — slow)
     if "--shakespeare" in sys.argv or "--full" in sys.argv:
-        passed, _ = test_shakespeare(max_chars=max_chars, codebook_mode=codebook_mode)
-        results["shakespeare"] = passed
+        passed, _ = test_shakespeare(max_chars=max_chars, codebook_mode=codebook_mode,
+                                     language=language)
+        results["corpus_training"] = passed
 
     # Test 5: QAMS vs Random comparison (optional)
     if "--compare" in sys.argv:
         print("\n" + "="*70)
-        print("  COMPARISON: Random vs QAMS Codebook")
+        print(f"  COMPARISON: Random vs QAMS Codebook ({language.capitalize()})")
         print("="*70)
 
         print("\n--- RANDOM CODEBOOK ---")
-        _, random_results = test_shakespeare(max_chars=max_chars, codebook_mode="random")
+        _, random_results = test_shakespeare(max_chars=max_chars, codebook_mode="random",
+                                             language=language)
 
         print("\n--- QAMS PHONETIC CODEBOOK ---")
-        _, qams_results = test_shakespeare(max_chars=max_chars, codebook_mode="qams")
+        _, qams_results = test_shakespeare(max_chars=max_chars, codebook_mode="qams",
+                                           language=language)
+
+        _print_comparison("COMPARISON RESULTS", random_results, qams_results, language)
+
+        n_chars = len(ALPHABET_FI if language == "finnish" else ALPHABET_EN)
+        results["compare_random"] = random_results['final_accuracy'] > 1.0 / n_chars
+        results["compare_qams"] = qams_results['final_accuracy'] > 1.0 / n_chars
+
+    # Test 6: Finnish vs English cross-language comparison (optional)
+    if "--finnish-compare" in sys.argv:
+        print("\n" + "="*70)
+        print("  CROSS-LANGUAGE COMPARISON: Finnish vs English")
+        print("="*70)
+
+        print("\n--- FINNISH + RANDOM ---")
+        _, fi_random = test_shakespeare(max_chars=max_chars, codebook_mode="random",
+                                        language="finnish")
+        print("\n--- FINNISH + QAMS ---")
+        _, fi_qams = test_shakespeare(max_chars=max_chars, codebook_mode="qams",
+                                      language="finnish")
+        print("\n--- ENGLISH + QAMS ---")
+        _, en_qams = test_shakespeare(max_chars=max_chars, codebook_mode="qams",
+                                      language="english")
 
         print("\n" + "="*70)
-        print("  COMPARISON RESULTS")
+        print("  CROSS-LANGUAGE RESULTS")
         print("="*70)
-        print(f"  Random final accuracy:  {random_results['final_accuracy']:.4f} ({random_results['final_accuracy']*100:.1f}%)")
-        print(f"  QAMS final accuracy:    {qams_results['final_accuracy']:.4f} ({qams_results['final_accuracy']*100:.1f}%)")
-        delta = qams_results['final_accuracy'] - random_results['final_accuracy']
-        if delta > 0:
-            print(f"  QAMS advantage:         +{delta:.4f} ({delta*100:.1f}%)")
-        else:
-            print(f"  Random advantage:       +{-delta:.4f} ({-delta*100:.1f}%)")
+        fi_delta = fi_qams['final_accuracy'] - fi_random['final_accuracy']
+        en_baseline = en_qams['final_accuracy']  # from earlier Step 4 runs
+        print(f"  Finnish + Random:  {fi_random['final_accuracy']:.4f} ({fi_random['final_accuracy']*100:.1f}%)")
+        print(f"  Finnish + QAMS:    {fi_qams['final_accuracy']:.4f} ({fi_qams['final_accuracy']*100:.1f}%)")
+        print(f"  Finnish QAMS gap:  {fi_delta:+.4f} ({fi_delta*100:+.1f}%)")
+        print(f"  English + QAMS:    {en_baseline:.4f} ({en_baseline*100:.1f}%)")
+        if fi_qams['history'] and fi_random['history']:
+            fi_q_early = fi_qams['history'][0]['accuracy']
+            fi_r_early = fi_random['history'][0]['accuracy']
+            print(f"  Finnish QAMS early gap: {fi_q_early - fi_r_early:+.4f} at step 1000")
 
-        if random_results['history'] and qams_results['history']:
-            r_early = random_results['history'][0]['accuracy'] if random_results['history'] else 0
-            q_early = qams_results['history'][0]['accuracy'] if qams_results['history'] else 0
-            print(f"  Random first window:    {r_early:.4f}")
-            print(f"  QAMS first window:      {q_early:.4f}")
-            if q_early > r_early:
-                print(f"  QAMS learns faster:     +{q_early - r_early:.4f} at step 1000")
+        print(f"\n  Finnish Random sample: {repr(fi_random['generated_sample'][:100])}")
+        print(f"  Finnish QAMS sample:   {repr(fi_qams['generated_sample'][:100])}")
+        print(f"  English QAMS sample:   {repr(en_qams['generated_sample'][:100])}")
 
-        print(f"\n  Random sample: {repr(random_results['generated_sample'][:100])}")
-        print(f"  QAMS sample:   {repr(qams_results['generated_sample'][:100])}")
-
-        results["compare_random"] = random_results['final_accuracy'] > 1.0 / NUM_CHARS
-        results["compare_qams"] = qams_results['final_accuracy'] > 1.0 / NUM_CHARS
+        n_fi = len(ALPHABET_FI)
+        results["fi_random"] = fi_random['final_accuracy'] > 1.0 / n_fi
+        results["fi_qams"] = fi_qams['final_accuracy'] > 1.0 / n_fi
+        results["en_qams"] = en_qams['final_accuracy'] > 1.0 / len(ALPHABET_EN)
 
     # Summary
     print("\n" + "="*70)
