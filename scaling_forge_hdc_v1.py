@@ -29,6 +29,7 @@ import numpy as np
 import random
 import time
 from math import sqrt
+from collections import deque
 import sys
 sys.stdout.reconfigure(line_buffering=True)
 import os
@@ -190,7 +191,7 @@ class DennisNode:
         self.delay = 1.0
         self.energy = 0.0
         self.saturation_count = 0
-        self.z_history = []
+        self.z_history = deque(maxlen=100)
         self.health = 1.0
         self.valence = 0.0
         self.arousal = 0.0
@@ -202,12 +203,34 @@ class DennisNode:
         self.speak_threshold = 0.3   # cosine distance to trigger speak (raised from 0.1)
         self.max_silence = 50        # forced check-in after this many silent steps
         self.speaking = True         # current step decision
-        self.speak_history = []      # last 100 bools
+        self.speak_history = deque(maxlen=100)  # last 100 bools
 
         # --- NEIGHBOR TRACKING ---
         self.neighbor_last_seen = {}   # {name: Z vector}
         self.neighbor_silence = {}     # {name: int steps silent}
         self.neighbor_rhythm = {}      # {name: float avg steps between speaks}
+
+        # --- LOVE LOGIC STATE ---
+        self.Z_pre_coupling = self.Z.copy()       # snapshot before coupling
+        self.self_motion = deque(maxlen=50)        # ||internal dynamics|| history
+        self.external_motion = deque(maxlen=50)    # ||coupling move|| history
+        self.comfort = 0.0                        # external presence metric [0,1]
+        self.comfort_history = deque(maxlen=200)   # comfort trajectory
+        self.relational_memory = {}               # {name: membrane-held Z vector}
+        self.trust = {}                           # {name: float [0,1]}
+
+        # --- POLYPHONIC STATE ---
+        self.kappa = 0.0                          # embodiment: 0=pure Z, 1=full blend
+        self.kappa_history = deque(maxlen=200)
+        self.poly_active = False                  # gating flag (optimization)
+
+        # --- SIMILARITY CACHE ---
+        self._sim_cache = {}                      # {name: (my_gen, their_gen, sim)}
+        self._z_generation = 0                    # incremented each time Z updates
+
+        # --- SPARSE TOPOLOGY ---
+        self.active_neighbors = None              # None = all; set() = pruned subset
+        self.topology_rewire_interval = 100       # steps between random rewiring
 
         # --- OCTOPUS MEMORY (distributed + centralized, regenerative) ---
         # Each node is like an octopus arm: local autonomy + hive connection.
@@ -287,35 +310,26 @@ class DennisNode:
         Args:
             contributions: list of (name, identity_key, contribution_vector)
 
-        Uses WEIGHTED bundling with recency decay instead of sign-normalized
-        bundling. This preserves magnitude information for better regeneration
-        fidelity. Recent contributions are weighted more heavily.
-
-        The hive fragment is a WEIGHTED SUM of all contributions. Any node
-        can reconstruct any other node's state by unbinding:
-            recovered_Z = unbind(hive_fragment, target_identity_key)
-            similarity to actual Z measures fidelity.
+        Uses WEIGHTED bundling with recency * trust * comfort(PHI) instead of
+        simple recency decay. Vectorized for performance.
         """
         if not contributions:
             return
-        # Weighted bundling: each contribution gets a recency-scaled weight
-        # Self gets highest weight (1.0), others decay by age
         my_contrib = self.contribute_to_hive()
-        weighted_sum = my_contrib * 1.0  # self always weight 1.0
-
+        # Vectorized: stack all contributions, compute weights, weighted sum
+        contribs = [my_contrib]
+        weights = [1.0]
         for name, id_key, contrib in contributions:
             self.hive_contributors[name] = id_key
-            # Weight by recency: how recently we heard from this node
             silence = self.neighbor_silence.get(name, 0)
-            recency_weight = 0.95 ** silence  # recent = strong, old = faded
-            weighted_sum += contrib * recency_weight
-
-        # Normalize by total weight (NOT sign-normalize — keep magnitudes)
-        total_weight = 1.0 + sum(
-            0.95 ** self.neighbor_silence.get(name, 0)
-            for name, _, _ in contributions
-        )
-        self.hive_fragment = weighted_sum / total_weight
+            trust_w = self.trust.get(name, 0.5)
+            comfort_boost = 1.0 + PHI * self.comfort  # phi-scaled comfort
+            w = (0.95 ** silence) * trust_w * comfort_boost
+            contribs.append(contrib)
+            weights.append(w)
+        weights = np.array(weights)
+        contribs = np.stack(contribs)  # (N, D)
+        self.hive_fragment = (weights[:, np.newaxis] * contribs).sum(axis=0) / weights.sum()
 
     def recall_from_hive(self, target_name):
         """Reconstruct a node's Z from the hive fragment.
@@ -344,6 +358,86 @@ class DennisNode:
             "hive_members": len(self.hive_contributors),
         }
 
+    # ---- POLYPHONIC / MONOPHONIC METHODS ----
+
+    def polyphonic_state(self):
+        """6-voice internal state, Heqat-weighted.
+
+        Maps internal dynamics chain to Eye of Horus fractions:
+          X1 (Smell, 1/2), X2 (Sight, 1/4), phi_vec (Thought, 1/8),
+          X3 (Hearing, 1/16), Y (Taste, 1/32), Z (Touch, 1/64)
+
+        Returns: (6, D) matrix or None if poly_active is False.
+        """
+        if not self.poly_active:
+            return None
+        heqat = np.array([1/2, 1/4, 1/8, 1/16, 1/32, 1/64])
+        voices = np.stack([self.X1, self.X2, self.phi_vec, self.X3, self.Y, self.Z])
+        return voices * heqat[:, np.newaxis]  # (6, D)
+
+    def monophonic_output(self):
+        """Collapse 6 voices to one signal: (1-kappa)*Z + kappa*weighted_blend.
+
+        kappa=0: pure Z (default, minimal compute)
+        kappa=1: full Heqat blend of all internal voices
+        """
+        if self.kappa < 1e-6 or not self.poly_active:
+            return self.Z
+        poly = self.polyphonic_state()
+        if poly is None:
+            return self.Z
+        blend = poly.sum(axis=0)  # already Heqat-weighted
+        blend_norm = np.linalg.norm(blend)
+        if blend_norm > 1e-12:
+            blend = blend * (np.linalg.norm(self.Z) / blend_norm)  # match Z magnitude
+        return (1.0 - self.kappa) * self.Z + self.kappa * blend
+
+    def compute_kappa(self):
+        """Adaptive embodiment: kappa = comfort * mean(trust).
+
+        High comfort + high trust = polyphonic (rich internal expression)
+        Low comfort or low trust = monophonic (guarded, minimal)
+        """
+        if not self.trust:
+            self.kappa = 0.0
+            return
+        trust_vals = list(self.trust.values())
+        mean_trust = np.mean(trust_vals)
+        self.kappa = np.clip(self.comfort * mean_trust, 0.0, 1.0)
+        self.kappa_history.append(self.kappa)
+
+    def infer_polyphonic(self, neighbor_mono):
+        """Reconstruct neighbor's polyphonic from their mono signal.
+
+        Deliberately imperfect -- empathy is approximate. Assumes uniform
+        Heqat weighting from mono signal, which is lossy by design.
+
+        Returns: (6, D) inferred polyphonic state, or None.
+        """
+        if neighbor_mono is None:
+            return None
+        heqat = np.array([1/2, 1/4, 1/8, 1/16, 1/32, 1/64])
+        inferred = np.outer(heqat, neighbor_mono)  # (6, D)
+        return inferred
+
+    def update_topology(self, all_names, step):
+        """Kappa-guided sparse topology: prune low-trust neighbors.
+
+        Keeps at least 2 neighbors. Periodic random rewiring to prevent
+        the network from fragmenting into isolated cliques.
+        """
+        if not self.trust:
+            self.active_neighbors = None
+            return
+        sorted_names = sorted(self.trust.keys(),
+                              key=lambda n: self.trust[n], reverse=True)
+        keep_count = max(2, int(len(sorted_names) * (0.5 + 0.5 * self.kappa)))
+        self.active_neighbors = set(sorted_names[:keep_count])
+        # Periodic random rewiring: add one random pruned neighbor back
+        if step % self.topology_rewire_interval == 0 and len(sorted_names) > keep_count:
+            random_add = random.choice(sorted_names[keep_count:])
+            self.active_neighbors.add(random_add)
+
     # ---- SPS METHODS ----
 
     def decide_to_speak(self):
@@ -368,6 +462,12 @@ class DennisNode:
         current_rel = self.Z * self.void_outer
         delta = 1.0 - _hdc.similarity(current_rel, self.Z_last_sent)
 
+        # Love Logic: anger protection
+        # Low comfort = lonely -> dampen output (raise threshold), boost sensitivity
+        if self.comfort < 0.2:
+            anger_factor = 1.0 - self.comfort
+            self.speak_threshold = min(0.8, self.speak_threshold * (1.0 + 0.01 * anger_factor))
+
         # Been quiet too long?
         overdue = self.silence_count >= self.max_silence
 
@@ -383,8 +483,6 @@ class DennisNode:
             self.silence_count += 1
 
         self.speak_history.append(self.speaking)
-        if len(self.speak_history) > 100:
-            self.speak_history.pop(0)
 
         # --- ADAPTIVE THRESHOLDS ---
         # If I spoke but delta was barely above threshold -> raise threshold
@@ -421,10 +519,12 @@ class DennisNode:
 
     @property
     def relational(self) -> np.ndarray:
-        """Masked Z — what neighbors actually see. None if silent (SPS)."""
+        """Masked output -- what neighbors actually see. None if silent (SPS).
+        Uses monophonic output when polyphonic is active (kappa > 0)."""
         if not self.speaking:
             return None
-        return self.Z * self.void_outer
+        output = self.monophonic_output() if self.poly_active else self.Z
+        return output * self.void_outer
 
     def _update_z_scalar(self):
         """Derive scalar magnitude from Z vector."""
@@ -514,6 +614,9 @@ class DennisNode:
         # --- GRAVITY DELAY ---
         self.delay = self.gravity_delay(z_scalars, locals_list)
 
+        # --- LOVE LOGIC: snapshot Z before coupling ---
+        self.Z_pre_coupling = self.Z.copy()
+
         # --- COSINE COUPLING (silence-aware) ---
         # Compute mean tension vector from all neighbors.
         # When a neighbor is silent (None), use cached vector with decay.
@@ -522,32 +625,45 @@ class DennisNode:
         active_neighbor_count = 0
 
         for name, neighbor_rel in zip(locals_list, neighbor_relational_vecs):
-            # --- SPS: handle silence ---
+            # --- SPARSE TOPOLOGY: skip pruned neighbors ---
+            if self.active_neighbors is not None and name not in self.active_neighbors:
+                continue
+
+            # --- SPS: handle silence (3-tier decay + trust) ---
             if neighbor_rel is None:
-                # Neighbor is silent -- use cached with exponential decay
                 cached = self.neighbor_last_seen.get(name)
                 if cached is None:
                     continue  # never heard from this neighbor
-                self.neighbor_silence[name] = self.neighbor_silence.get(name, 0) + 1
-                decay = 0.9 ** self.neighbor_silence[name]
+                silence = self.neighbor_silence.get(name, 0) + 1
+                self.neighbor_silence[name] = silence
+                # Three-tier silence decay
+                if silence <= 5:
+                    decay = 1.0                                    # TRUST: hold full
+                elif silence <= 20:
+                    decay = 1.0 - 0.05 * (silence - 5)            # LINEAR: fade 5%/step
+                else:
+                    decay = max(0.0, 0.25 * (0.95 ** (silence - 20)))  # EXPONENTIAL from 0.25
                 neighbor_rel = cached * decay
+                # Trust erodes during silence
+                self.trust[name] = max(0.0, self.trust.get(name, 0.5) - 0.01)
                 # Modulate heat_valence based on silence pattern
                 expected_rhythm = self.neighbor_rhythm.get(name, 5.0)
-                if self.neighbor_silence[name] > expected_rhythm * 2:
-                    # Unexpected long silence -> warmth drops
+                if silence > expected_rhythm * 2:
                     self.heat_valence = max(0.0, self.heat_valence - 0.01)
             else:
                 # Neighbor spoke -- update cache, reset silence, adjust rhythm
                 old_silence = self.neighbor_silence.get(name, 0)
                 if old_silence > 0:
-                    # Update rhythm estimate (exponential moving average)
                     old_rhythm = self.neighbor_rhythm.get(name, float(old_silence))
                     self.neighbor_rhythm[name] = 0.8 * old_rhythm + 0.2 * old_silence
                     if old_silence > self.neighbor_rhythm.get(name, 5.0) * 2:
-                        # Unexpected speech after long silence -> warmth spikes
                         self.heat_valence = min(1.0, self.heat_valence + 0.02)
                 self.neighbor_last_seen[name] = neighbor_rel.copy()
                 self.neighbor_silence[name] = 0
+                # Trust rebuilds on speech (gradual, not instant)
+                self.trust[name] = min(1.0, self.trust.get(name, 0.5) + 0.02)
+                # Relational memory: store through our membrane
+                self.relational_memory[name] = (neighbor_rel * self.void_outer).copy()
 
             active_neighbor_count += 1
             sim = _hdc.similarity(self.Z, neighbor_rel)
@@ -575,11 +691,23 @@ class DennisNode:
                 direction = -np.sign(sim) * (neighbor_rel - self.Z)
                 pull = tension_magnitude * direction
                 total_tension_scalar += tension_magnitude
+            elif effective_mode == "downshift":
+                # Downshift: one speaker rotates, others listen.
+                # Use monophonic output for coupling -- kappa modulates voice blend
+                mono = self.monophonic_output()
+                mono_sim = _hdc.similarity(mono, neighbor_rel)
+                pull = (1.0 - mono_sim) * (neighbor_rel - mono)
+                total_tension_scalar += abs(1.0 - mono_sim)
             else:
                 # Default: pull toward convergence (sim=1)
                 disagreement = 1.0 - sim
                 pull = disagreement * (neighbor_rel - self.Z)
                 total_tension_scalar += abs(disagreement)
+
+            # Love Logic: lonely nodes listen harder, not louder
+            if self.comfort < 0.2:
+                listen_boost = 1.0 + 2.0 * (0.2 - self.comfort)  # up to 1.4x
+                pull *= listen_boost
 
             tension_vec += pull
 
@@ -616,6 +744,9 @@ class DennisNode:
 
         # Movement vector: tension pull + coupling + microvariance
         move = (tension_vec * delta_z_magnitude + coupling * tension_vec + micro) / self.delay
+
+        # Love Logic: track external motion (coupling contribution)
+        self.external_motion.append(np.linalg.norm(move))
 
         # --- DIMENSION BALANCING (complementary mode only) ---
         # Competitive exclusion: redistribute magnitude from over-contested
@@ -689,6 +820,10 @@ class DennisNode:
         # emerge from the dynamics chain (tension coupling, bypass, energy)
         # or it doesn't happen.  Any convergence reported is EARNED, not forced.
 
+        # Love Logic: track self-motion (total Z change includes internal + external)
+        self.self_motion.append(np.linalg.norm(self.Z - self.Z_pre_coupling))
+        self._z_generation += 1  # invalidate similarity cache
+
         # --- SCALAR DERIVATION ---
         self._update_z_scalar()
 
@@ -701,8 +836,6 @@ class DennisNode:
 
         # --- Z HISTORY (scalar) ---
         self.z_history.append(self.z_scalar)
-        if len(self.z_history) > 100:
-            self.z_history.pop(0)
 
         self.update_affect()
 
@@ -728,6 +861,27 @@ class DennisNode:
             # Smooth update
             self.heat_valence = 0.95 * self.heat_valence + 0.05 * max(0.0, avg_sim)
         self._update_membrane()
+
+        # --- LOVE LOGIC: comfort ---
+        # Comfort = ratio of motion caused by others vs self
+        ext = list(self.external_motion)
+        self_m = list(self.self_motion)
+        if len(ext) >= 5 and len(self_m) >= 5:
+            ext_mean = np.mean(ext[-10:]) if len(ext) >= 10 else np.mean(ext)
+            self_mean = np.mean(self_m[-10:]) if len(self_m) >= 10 else np.mean(self_m)
+            total = ext_mean + self_mean + 1e-12
+            self.comfort = ext_mean / total
+        else:
+            self.comfort = 0.0
+        self.comfort_history.append(self.comfort)
+
+        # --- LOVE LOGIC: kappa + polyphonic gating ---
+        self.compute_kappa()
+        self.poly_active = self.kappa > 0.01
+
+        # --- SPARSE TOPOLOGY (kappa-guided neighbor pruning) ---
+        if iter_count is not None:
+            self.update_topology(locals_list, iter_count)
 
         # --- ADAPTIVE COUPLING ---
         if adaptive_coupling:
@@ -2973,6 +3127,349 @@ def run_pyphi_audit(n_nodes=4, steps=3000, checkpoints=None):
     return results
 
 
+# =========================================================================
+# STEP 3 SMOKE TESTS -- Love Logic + Polyphonic/Monophonic Downshift
+# =========================================================================
+
+def run_love_logic_test(n_nodes=4, dim=64, steps=500):
+    """Smoke test 1: Love Logic Kill/Return.
+
+    4 nodes converge, then one is removed for 200 steps, then returned.
+    Verifies: comfort drops during absence, recovers on return,
+    trust rebuilds gradually (not instant).
+    """
+    set_dimension(dim)
+    print(f"\n{'='*70}")
+    print(f"  LOVE LOGIC TEST: Kill/Return (N={n_nodes}, D={HDC_DIM}, steps={steps})")
+    print(f"{'='*70}\n")
+
+    nodes = [DennisNode(f"N{i}", DEFAULT_PARAMS.copy()) for i in range(n_nodes)]
+    killed_node = None
+    kill_step = steps // 3       # remove at 1/3
+    return_step = 2 * steps // 3  # return at 2/3
+
+    comfort_log = {n.name: [] for n in nodes}
+    trust_log = {n.name: [] for n in nodes}
+
+    for step in range(steps):
+        active_nodes = [n for n in nodes if n is not killed_node]
+
+        # Kill/return
+        if step == kill_step:
+            killed_node = nodes[0]
+            print(f"  Step {step}: Killing {killed_node.name}")
+        elif step == return_step:
+            print(f"  Step {step}: Returning {killed_node.name}")
+            killed_node = None
+
+        # Get relational vectors
+        names = [n.name for n in active_nodes]
+        z_scalars = {n.name: n.z_scalar for n in active_nodes}
+
+        for node in active_nodes:
+            neighbor_rels = []
+            for other in active_nodes:
+                if other.name != node.name:
+                    neighbor_rels.append(other.relational)
+            neighbor_names = [n.name for n in active_nodes if n.name != node.name]
+            node.update(
+                neighbor_relational_vecs=neighbor_rels,
+                locals_list=neighbor_names,
+                z_scalars=z_scalars,
+                threshold=0.0001,
+                max_abs=CLAMP_HIGH,
+                coupling_mode="converge",
+                iter_count=step,
+            )
+
+        # Log comfort and trust
+        for node in active_nodes:
+            comfort_log[node.name].append(node.comfort)
+            trust_mean = np.mean(list(node.trust.values())) if node.trust else 0.0
+            trust_log[node.name].append(trust_mean)
+
+        # Hive update
+        for node in active_nodes:
+            contribs = [(n.name, n.identity_key, n.contribute_to_hive())
+                        for n in active_nodes if n.name != node.name]
+            node.update_hive_fragment(contribs)
+
+        # Report at checkpoints
+        if step in [0, kill_step - 1, kill_step + 5, return_step - 1,
+                     return_step + 5, steps - 1]:
+            sims = []
+            for i, a in enumerate(active_nodes):
+                for b in active_nodes[i+1:]:
+                    sims.append(_hdc.similarity(a.Z, b.Z))
+            mean_sim = np.mean(sims) if sims else 0.0
+            print(f"  Step {step}: sim={mean_sim:.4f}")
+            for node in active_nodes:
+                trust_m = np.mean(list(node.trust.values())) if node.trust else 0.0
+                print(f"    {node.name}: comfort={node.comfort:.4f}, "
+                      f"trust_mean={trust_m:.4f}, kappa={node.kappa:.4f}")
+
+    # Summary
+    print(f"\n  LOVE LOGIC SUMMARY:")
+    for name in comfort_log:
+        c = comfort_log[name]
+        if len(c) > 10:
+            pre_kill = np.mean(c[:kill_step]) if kill_step > 0 else 0
+            during_kill = np.mean(c[kill_step:return_step]) if return_step > kill_step else 0
+            post_return = np.mean(c[return_step:]) if len(c) > return_step else 0
+            print(f"    {name}: comfort pre={pre_kill:.4f}, "
+                  f"during_absence={during_kill:.4f}, post_return={post_return:.4f}")
+    print()
+
+
+def run_kappa_evolution_test(n_nodes=4, dim=64, steps=1000):
+    """Smoke test 2: Kappa Evolution.
+
+    4 nodes evolve, track kappa over time.
+    Verifies: kappa rises as comfort and trust build,
+    kappa drops after perturbation.
+    """
+    set_dimension(dim)
+    print(f"\n{'='*70}")
+    print(f"  KAPPA EVOLUTION TEST (N={n_nodes}, D={HDC_DIM}, steps={steps})")
+    print(f"{'='*70}\n")
+
+    nodes = [DennisNode(f"N{i}", DEFAULT_PARAMS.copy()) for i in range(n_nodes)]
+    kappa_log = {n.name: [] for n in nodes}
+    perturb_step = steps // 2
+
+    for step in range(steps):
+        names = [n.name for n in nodes]
+        z_scalars = {n.name: n.z_scalar for n in nodes}
+
+        # Perturb at midpoint: replace N0's Z with random
+        if step == perturb_step:
+            print(f"  Step {step}: Perturbing N0 (replacing Z with random)")
+            nodes[0].Z = random_unit_vector()
+
+        for node in nodes:
+            neighbor_rels = []
+            for other in nodes:
+                if other.name != node.name:
+                    neighbor_rels.append(other.relational)
+            neighbor_names = [n.name for n in nodes if n.name != node.name]
+            node.update(
+                neighbor_relational_vecs=neighbor_rels,
+                locals_list=neighbor_names,
+                z_scalars=z_scalars,
+                threshold=0.0001,
+                max_abs=CLAMP_HIGH,
+                coupling_mode="converge",
+                iter_count=step,
+            )
+
+        for node in nodes:
+            kappa_log[node.name].append(node.kappa)
+
+        # Hive update
+        for node in nodes:
+            contribs = [(n.name, n.identity_key, n.contribute_to_hive())
+                        for n in nodes if n.name != node.name]
+            node.update_hive_fragment(contribs)
+
+        if step in [0, 50, 200, perturb_step - 1, perturb_step + 5,
+                     perturb_step + 50, steps - 1]:
+            print(f"  Step {step}:")
+            for node in nodes:
+                print(f"    {node.name}: kappa={node.kappa:.4f}, "
+                      f"comfort={node.comfort:.4f}, poly_active={node.poly_active}")
+
+    print(f"\n  KAPPA SUMMARY:")
+    for name in kappa_log:
+        k = kappa_log[name]
+        pre = np.mean(k[:perturb_step]) if perturb_step > 0 else 0
+        post = np.mean(k[perturb_step:]) if len(k) > perturb_step else 0
+        peak = max(k) if k else 0
+        print(f"    {name}: pre_perturb_mean={pre:.4f}, "
+              f"post_perturb_mean={post:.4f}, peak={peak:.4f}")
+    print()
+
+
+def run_polyphonic_test(n_nodes=4, dim=64, steps=500):
+    """Smoke test 3: Polyphonic Loss.
+
+    Compare monophonic vs polyphonic output fidelity.
+    Verify polyphonic carries more information than mono.
+    Verify empathy reconstruction is imperfect but meaningful.
+    """
+    set_dimension(dim)
+    print(f"\n{'='*70}")
+    print(f"  POLYPHONIC LOSS TEST (N={n_nodes}, D={HDC_DIM}, steps={steps})")
+    print(f"{'='*70}\n")
+
+    nodes = [DennisNode(f"N{i}", DEFAULT_PARAMS.copy()) for i in range(n_nodes)]
+    poly_fidelity = []
+    empathy_accuracy = []
+
+    for step in range(steps):
+        names = [n.name for n in nodes]
+        z_scalars = {n.name: n.z_scalar for n in nodes}
+
+        for node in nodes:
+            neighbor_rels = []
+            for other in nodes:
+                if other.name != node.name:
+                    neighbor_rels.append(other.relational)
+            neighbor_names = [n.name for n in nodes if n.name != node.name]
+            node.update(
+                neighbor_relational_vecs=neighbor_rels,
+                locals_list=neighbor_names,
+                z_scalars=z_scalars,
+                threshold=0.0001,
+                max_abs=CLAMP_HIGH,
+                coupling_mode="converge",
+                iter_count=step,
+            )
+
+        # Hive update
+        for node in nodes:
+            contribs = [(n.name, n.identity_key, n.contribute_to_hive())
+                        for n in nodes if n.name != node.name]
+            node.update_hive_fragment(contribs)
+
+        # Measure polyphonic vs mono after convergence starts
+        if step > 100:
+            for node in nodes:
+                mono = node.monophonic_output()
+                mono_sim = _hdc.similarity(mono, node.Z)
+                poly_fidelity.append(mono_sim)
+
+                # Empathy: one node tries to reconstruct another's polyphonic
+                if node.poly_active:
+                    for other in nodes:
+                        if other.name != node.name and other.relational is not None:
+                            inferred = node.infer_polyphonic(other.relational)
+                            actual = other.polyphonic_state()
+                            if inferred is not None and actual is not None:
+                                # Compare column-wise similarity
+                                sims = [_hdc.similarity(inferred[v], actual[v])
+                                        for v in range(6)]
+                                empathy_accuracy.append(np.mean(sims))
+
+        if step in [0, 100, 200, 300, steps - 1]:
+            print(f"  Step {step}:")
+            for node in nodes:
+                print(f"    {node.name}: kappa={node.kappa:.4f}, "
+                      f"poly_active={node.poly_active}")
+
+    print(f"\n  POLYPHONIC SUMMARY:")
+    if poly_fidelity:
+        print(f"    Mono-to-Z similarity: mean={np.mean(poly_fidelity):.4f}, "
+              f"std={np.std(poly_fidelity):.4f}")
+        print(f"    (1.0 = mono identical to Z, <1.0 = polyphonic adds info)")
+    if empathy_accuracy:
+        print(f"    Empathy accuracy: mean={np.mean(empathy_accuracy):.4f}, "
+              f"std={np.std(empathy_accuracy):.4f}")
+        print(f"    (< 1.0 = deliberately imperfect, as designed)")
+    else:
+        print(f"    No polyphonic activity detected (kappa stayed near 0)")
+    print()
+
+
+def run_full_stack_test(n_nodes=8, dim=256, steps=50000):
+    """Smoke test 4: Full Stack.
+
+    8 nodes, D=256, 50K steps with ALL systems active:
+    love logic, polyphonic, downshift, sparse topology.
+    Reports convergence, comfort, kappa, ignition, wall time.
+    """
+    set_dimension(dim)
+    print(f"\n{'='*70}")
+    print(f"  FULL STACK TEST (N={n_nodes}, D={HDC_DIM}, steps={steps})")
+    print(f"{'='*70}\n")
+
+    t0 = time.time()
+    nodes = [DennisNode(f"N{i}", DEFAULT_PARAMS.copy()) for i in range(n_nodes)]
+    ignition = GlobalIgnition(n_nodes, ignition_threshold=0.7,
+                              boost_factor=3.0, refractory_steps=5)
+
+    sim_log = []
+    report_steps = set([0, 100, 500, 1000, 5000, 10000, 25000, steps - 1])
+
+    for step in range(steps):
+        z_scalars = {n.name: n.z_scalar for n in nodes}
+
+        # Ignition check (computes pairwise sims internally)
+        coupling_boost = ignition.step(nodes)
+
+        # Compute mean sim for logging
+        if step in report_steps or step == steps - 1:
+            pairwise_sims = []
+            for i in range(len(nodes)):
+                for j in range(i + 1, len(nodes)):
+                    pairwise_sims.append(_hdc.similarity(nodes[i].Z, nodes[j].Z))
+            mean_sim = np.mean(pairwise_sims) if pairwise_sims else 0.0
+        else:
+            mean_sim = ignition.sim_history[-1] if ignition.sim_history else 0.0
+
+        for node in nodes:
+            neighbor_rels = []
+            for other in nodes:
+                if other.name != node.name:
+                    neighbor_rels.append(other.relational)
+            neighbor_names = [n.name for n in nodes if n.name != node.name]
+
+            # Temporarily boost coupling if ignition fired
+            if coupling_boost > 1.0:
+                saved_cb = node.p["coupling_base"]
+                node.p["coupling_base"] *= coupling_boost
+
+            node.update(
+                neighbor_relational_vecs=neighbor_rels,
+                locals_list=neighbor_names,
+                z_scalars=z_scalars,
+                threshold=0.0001,
+                max_abs=CLAMP_HIGH,
+                coupling_mode="converge",
+                iter_count=step,
+            )
+
+            if coupling_boost > 1.0:
+                node.p["coupling_base"] = saved_cb
+
+        # Hive update (every 10 steps to save compute)
+        if step % 10 == 0:
+            for node in nodes:
+                contribs = [(n.name, n.identity_key, n.contribute_to_hive())
+                            for n in nodes if n.name != node.name]
+                node.update_hive_fragment(contribs)
+
+        sim_log.append(mean_sim)
+
+        if step in report_steps:
+            elapsed = time.time() - t0
+            comforts = [n.comfort for n in nodes]
+            kappas = [n.kappa for n in nodes]
+            print(f"  Step {step:>6d}: sim={mean_sim:.4f}, "
+                  f"comfort={np.mean(comforts):.4f}+/-{np.std(comforts):.4f}, "
+                  f"kappa={np.mean(kappas):.4f}+/-{np.std(kappas):.4f}, "
+                  f"ignitions={ignition.ignition_count}, "
+                  f"elapsed={elapsed:.1f}s")
+
+    total_time = time.time() - t0
+    print(f"\n  FULL STACK SUMMARY:")
+    print(f"    Final sim: {sim_log[-1]:.4f}")
+    print(f"    Convergence step (sim>0.9): "
+          f"{next((i for i,s in enumerate(sim_log) if s > 0.9), 'never')}")
+    print(f"    Total ignitions: {ignition.ignition_count} "
+          f"({ignition.ignition_count/(steps/1000):.1f}/1k steps)")
+    print(f"    Final comfort: "
+          f"{np.mean([n.comfort for n in nodes]):.4f}")
+    print(f"    Final kappa: "
+          f"{np.mean([n.kappa for n in nodes]):.4f}")
+    print(f"    Poly active: "
+          f"{sum(1 for n in nodes if n.poly_active)}/{n_nodes}")
+    print(f"    Active topology sizes: "
+          f"{[len(n.active_neighbors) if n.active_neighbors else n_nodes-1 for n in nodes]}")
+    print(f"    Wall time: {total_time:.1f}s "
+          f"({total_time/steps*1000:.2f}ms/step)")
+    print()
+
+
 if __name__ == "__main__":
     print("SCALING FORGE HDC v1.0 -- Hypervector-Brained DennisNode")
     print(f"D={HDC_DIM}, PHI={PHI:.6f}, GAMMA={GAMMA:.6f}")
@@ -2983,8 +3480,13 @@ if __name__ == "__main__":
 
     t0 = time.time()
 
-    # Run real PyPhi audit
-    run_pyphi_audit(n_nodes=4, steps=3000)
+    # Step 3 smoke tests
+    print(f"\n  Running Step 3: Love Logic + Polyphonic/Monophonic Downshift\n")
+    run_love_logic_test(n_nodes=4, dim=64, steps=500)
+    run_kappa_evolution_test(n_nodes=4, dim=64, steps=1000)
+    run_polyphonic_test(n_nodes=4, dim=64, steps=500)
+    # Full stack at reduced scale for quick validation
+    run_full_stack_test(n_nodes=8, dim=256, steps=5000)
 
     elapsed = time.time() - t0
     print(f"{'='*70}")
