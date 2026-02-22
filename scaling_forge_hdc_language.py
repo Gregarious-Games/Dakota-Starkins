@@ -27,6 +27,7 @@ from scaling_forge_hdc_v1 import (
     CLAMP_HIGH, PHI, GAMMA, TAU,
     random_unit_vector, clamp_vector, HDC_DIM, _hdc,
 )
+from qams_codebook import generate_qams_codebook, PHONETIC_SIGNATURES
 
 # ═══════════════════════════════════════════════════════════════════════════
 # CONSTANTS
@@ -69,19 +70,33 @@ class HDCTokenizer:
     A text window is encoded as: bundle(bind(char_i, pos_i) for i in window).
     """
 
-    def __init__(self, dim=D, context_window=CONTEXT_WINDOW, seed=42):
+    def __init__(self, dim=D, context_window=CONTEXT_WINDOW, seed=42, mode="random"):
         self.dim = dim
         self.context_window = context_window
+        self.mode = mode
         self.rng = np.random.default_rng(seed)
         self.hdc = HDCPrimitives(dim=dim, rng=self.rng)
 
-        # Character codebook: 65 chars -> bipolar D-vectors
+        # Character codebook
         self.chars = ALPHABET
         self.char_to_idx = {c: i for i, c in enumerate(self.chars)}
         self.idx_to_char = {i: c for i, c in enumerate(self.chars)}
-        self.char_codebook = {}
-        for c in self.chars:
-            self.char_codebook[c] = self.hdc.random_bipolar()
+
+        if mode == "qams":
+            # QAMS phonetic motion vectors — physics-derived codebook
+            qams_cb = generate_qams_codebook(D=dim, seed=seed)
+            self.char_codebook = {}
+            for c in self.chars:
+                if c in qams_cb:
+                    self.char_codebook[c] = qams_cb[c]
+                else:
+                    # Fallback for chars not in PHONETIC_SIGNATURES
+                    self.char_codebook[c] = self.hdc.random_bipolar()
+        else:
+            # Random bipolar codebook (original behavior)
+            self.char_codebook = {}
+            for c in self.chars:
+                self.char_codebook[c] = self.hdc.random_bipolar()
 
         # Position codebook: Weyl-permuted from a single basis vector
         self.pos_basis = self.hdc.random_bipolar()
@@ -182,16 +197,19 @@ class SwarmLanguageModel:
 
     def __init__(self, n_nodes=N_NODES, context_window=CONTEXT_WINDOW,
                  swarm_steps=SWARM_STEPS, dim=D,
-                 output_strategy="centroid", seed=42):
+                 output_strategy="centroid", seed=42,
+                 codebook_mode="random"):
         self.n_nodes = n_nodes
         self.context_window = context_window
         self.swarm_steps = swarm_steps
         self.dim = dim
         self.output_strategy = output_strategy
         self.seed = seed
+        self.codebook_mode = codebook_mode
 
         # Tokenizer
-        self.tokenizer = HDCTokenizer(dim=dim, context_window=context_window, seed=seed)
+        self.tokenizer = HDCTokenizer(dim=dim, context_window=context_window,
+                                      seed=seed, mode=codebook_mode)
 
         # Create DennisNodes
         self.nodes = []
@@ -622,13 +640,14 @@ def test_pattern_learning():
     return passed
 
 
-def test_shakespeare(max_chars=50000):
+def test_shakespeare(max_chars=50000, codebook_mode="random"):
     """Test 4: Train on Shakespeare, report accuracy curve + generate."""
     print("\n" + "="*60)
-    print("  TEST 4: Shakespeare Training")
+    print(f"  TEST 4: Shakespeare Training (codebook={codebook_mode})")
     print("="*60)
 
-    model = SwarmLanguageModel(n_nodes=N_NODES, swarm_steps=SWARM_STEPS)
+    model = SwarmLanguageModel(n_nodes=N_NODES, swarm_steps=SWARM_STEPS,
+                               codebook_mode=codebook_mode)
     results = model.train_shakespeare(max_chars=max_chars)
 
     random_baseline = 1.0 / NUM_CHARS
@@ -639,7 +658,7 @@ def test_shakespeare(max_chars=50000):
     else:
         print(f"  FAIL: Final accuracy {results['final_accuracy']:.3f} <= baseline {random_baseline:.3f}")
 
-    return passed
+    return passed, results
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -651,6 +670,15 @@ if __name__ == "__main__":
     print("  SCALING FORGE HDC LANGUAGE — Project Karpathy")
     print("  Step 4: HDC Tokenizer + Swarm Language Model")
     print("="*70)
+
+    # Parse CLI args
+    codebook_mode = "random"
+    max_chars = 50000
+    for arg in sys.argv:
+        if arg.startswith("--codebook="):
+            codebook_mode = arg.split("=")[1]
+        if arg.startswith("--max-chars="):
+            max_chars = int(arg.split("=")[1])
 
     results = {}
 
@@ -665,11 +693,45 @@ if __name__ == "__main__":
 
     # Test 4: Shakespeare (optional — slow)
     if "--shakespeare" in sys.argv or "--full" in sys.argv:
-        max_chars = 50000
-        for arg in sys.argv:
-            if arg.startswith("--max-chars="):
-                max_chars = int(arg.split("=")[1])
-        results["shakespeare"] = test_shakespeare(max_chars=max_chars)
+        passed, _ = test_shakespeare(max_chars=max_chars, codebook_mode=codebook_mode)
+        results["shakespeare"] = passed
+
+    # Test 5: QAMS vs Random comparison (optional)
+    if "--compare" in sys.argv:
+        print("\n" + "="*70)
+        print("  COMPARISON: Random vs QAMS Codebook")
+        print("="*70)
+
+        print("\n--- RANDOM CODEBOOK ---")
+        _, random_results = test_shakespeare(max_chars=max_chars, codebook_mode="random")
+
+        print("\n--- QAMS PHONETIC CODEBOOK ---")
+        _, qams_results = test_shakespeare(max_chars=max_chars, codebook_mode="qams")
+
+        print("\n" + "="*70)
+        print("  COMPARISON RESULTS")
+        print("="*70)
+        print(f"  Random final accuracy:  {random_results['final_accuracy']:.4f} ({random_results['final_accuracy']*100:.1f}%)")
+        print(f"  QAMS final accuracy:    {qams_results['final_accuracy']:.4f} ({qams_results['final_accuracy']*100:.1f}%)")
+        delta = qams_results['final_accuracy'] - random_results['final_accuracy']
+        if delta > 0:
+            print(f"  QAMS advantage:         +{delta:.4f} ({delta*100:.1f}%)")
+        else:
+            print(f"  Random advantage:       +{-delta:.4f} ({-delta*100:.1f}%)")
+
+        if random_results['history'] and qams_results['history']:
+            r_early = random_results['history'][0]['accuracy'] if random_results['history'] else 0
+            q_early = qams_results['history'][0]['accuracy'] if qams_results['history'] else 0
+            print(f"  Random first window:    {r_early:.4f}")
+            print(f"  QAMS first window:      {q_early:.4f}")
+            if q_early > r_early:
+                print(f"  QAMS learns faster:     +{q_early - r_early:.4f} at step 1000")
+
+        print(f"\n  Random sample: {repr(random_results['generated_sample'][:100])}")
+        print(f"  QAMS sample:   {repr(qams_results['generated_sample'][:100])}")
+
+        results["compare_random"] = random_results['final_accuracy'] > 1.0 / NUM_CHARS
+        results["compare_qams"] = qams_results['final_accuracy'] > 1.0 / NUM_CHARS
 
     # Summary
     print("\n" + "="*70)

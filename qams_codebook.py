@@ -1,0 +1,247 @@
+"""
+QAMS Phonetic Codebook for HDC Language Model
+==============================================
+Drop-in replacement for random codebook in scaling_forge_hdc_language.py
+
+Every symbol is a motion primitive. Encode the motion, not an arbitrary label.
+
+6 phonetic parameters per character:
+  [aperture, duration, voicing, place, manner, frequency]
+
+Characters with similar phonetics get similar hypervectors.
+Characters with different phonetics get dissimilar hypervectors.
+
+Usage:
+    from qams_codebook import generate_qams_codebook, PHONETIC_SIGNATURES
+    codebook = generate_qams_codebook(D=256)
+
+Authors: Rose (Claude) & Greg Calkins
+Date:    February 21, 2026
+"""
+
+import numpy as np
+
+# ============================================================
+# PHONETIC MOTION SIGNATURES — TERNARY ENCODING
+# 6 parameters per character:
+#   [aperture, duration, voicing, place, manner, frequency]
+#
+# TERNARY: each axis is [-1, 0, +1]
+#   Zero is NOT absence — zero is the SPS silence channel.
+#   The dimensions where a character has parameter=0 are the
+#   dimensions where that character is SILENT on that phonetic axis.
+#
+# aperture:  -1=closed (active blockage), 0=neutral, +1=open
+# duration:  -1=impulse/burst, 0=medium, +1=sustained
+# voicing:   -1=unvoiced (cords held open), 0=neutral, +1=voiced
+# place:     -1=lips (bilabial), 0=palate (alveolar), +1=throat (velar/glottal)
+# manner:    -1=stop (complete blockage), 0=fricative, +1=approximant/open
+# frequency: -1=low, 0=mid, +1=high
+# ============================================================
+
+PHONETIC_SIGNATURES = {
+    # Vowels — open, sustained, voiced, approximant
+    #          [aper, dur,  voic, place, mann, freq]
+    'a': [+1.0, +1.0, +1.0,  0.0, +1.0, -0.4],  # open, central, low-mid
+    'e': [+0.5, +0.8, +1.0, -0.2, +1.0,  0.0],  # mid-front
+    'i': [+0.0, +0.7, +1.0, -0.4, +1.0, +0.6],  # close-front, high
+    'o': [+0.6, +0.8, +1.0, +0.2, +1.0, -0.5],  # mid-back, low
+    'u': [+0.0, +0.7, +1.0, +0.4, +1.0, -0.6],  # close-back, lowest
+
+    # Plosives — closed, impulse, stop
+    #          [aper, dur,  voic, place, mann, freq]
+    'b': [-1.0, -1.0, +1.0, -1.0, -1.0, -0.7],  # voiced bilabial stop
+    'p': [-1.0, -1.0, -1.0, -1.0, -1.0, -0.6],  # UNvoiced bilabial stop
+    'd': [-1.0, -1.0, +1.0,  0.0, -1.0, -0.4],  # voiced alveolar stop
+    't': [-1.0, -1.0, -1.0,  0.0, -1.0, +0.2],  # UNvoiced alveolar stop
+    'g': [-1.0, -1.0, +1.0, +0.8, -1.0, -0.6],  # voiced velar stop
+    'k': [-1.0, -1.0, -1.0, +0.8, -1.0, -0.5],  # UNvoiced velar stop
+
+    # Fricatives — narrow aperture, sustained, fricative manner
+    #          [aper, dur,  voic, place, mann, freq]
+    'f': [-0.7, +0.5, -1.0, -0.8, 0.0, +0.3],   # unvoiced labiodental
+    'v': [-0.7, +0.5, +1.0, -0.8, 0.0, +0.1],   # voiced labiodental
+    's': [-0.8, +0.6, -1.0,  0.0, 0.0, +0.7],   # unvoiced alveolar (high freq)
+    'z': [-0.8, +0.6, +1.0,  0.0, 0.0, +0.5],   # voiced alveolar
+    'h': [ 0.0, +0.3, -1.0, +1.0, 0.0, -0.4],   # unvoiced glottal
+
+    # Nasals — closed mouth, voiced, nasal manner (~+0.5 between fric and approx)
+    #          [aper, dur,  voic, place, mann, freq]
+    'm': [-1.0, +0.6, +1.0, -1.0, +0.5, -0.7],  # bilabial nasal
+    'n': [-1.0, +0.5, +1.0,  0.0, +0.5, -0.5],  # alveolar nasal
+
+    # Approximants / Liquids — partially open, voiced, approximant
+    #          [aper, dur,  voic, place, mann, freq]
+    'l': [ 0.0, +0.5, +1.0,  0.0, +1.0, -0.3],  # lateral approximant
+    'r': [-0.3, +0.4, +1.0, +0.1, +1.0, -0.4],  # alveolar approximant
+    'w': [-0.4, +0.2, +1.0, -1.0, +1.0, -0.7],  # labial-velar approximant
+    'y': [-0.3, +0.2, +1.0, -0.4, +1.0, +0.4],  # palatal approximant
+
+    # Affricates / Special consonants
+    #          [aper, dur,  voic, place, mann, freq]
+    'c': [-0.9, -0.5, -1.0,  0.0, -0.5, +0.1],  # k/s blend
+    'j': [-0.8, -0.4, +1.0, -0.1, -0.5,  0.0],  # voiced affricate
+    'q': [-1.0, -1.0, -1.0, +0.8, -1.0, -0.5],  # like k
+    'x': [-0.9, -0.3, -1.0,  0.0, -0.5, +0.4],  # k+s blend
+
+    # Punctuation — SILENCE PRIMITIVES (SPS for text)
+    # All axes at 0 = pure silence. Frequency differentiates energy level.
+    #          [aper, dur,  voic, place, mann, freq]
+    ' ':  [ 0.0,  0.0,  0.0,  0.0,  0.0,  0.0],  # space = pure silence
+    '.':  [ 0.0,  0.0,  0.0,  0.0,  0.0, -0.1],  # period = terminal silence
+    ',':  [ 0.0,  0.0,  0.0,  0.0,  0.0, +0.1],  # comma = brief pause
+    '!':  [ 0.0,  0.0,  0.0,  0.0,  0.0, +0.9],  # exclamation = energy burst
+    '?':  [ 0.0,  0.0,  0.0,  0.0,  0.0, +0.6],  # question = rising energy
+    ':':  [ 0.0,  0.0,  0.0,  0.0,  0.0, +0.2],  # colon = sustained pause
+    ';':  [ 0.0,  0.0,  0.0,  0.0,  0.0, +0.15], # semicolon = medium pause
+    '-':  [ 0.0,  0.0,  0.0,  0.0,  0.0, -0.2],  # dash = connecting silence
+    "'":  [-0.5, -0.8, -1.0, +1.0, -0.5, +0.0],  # apostrophe = glottal flick
+    '\n': [ 0.0,  0.0,  0.0,  0.0,  0.0,  0.0],  # newline = paragraph silence
+
+    # Digits — rhythmic count patterns (frequency ramp from -1 to +1)
+    #          [aper, dur,  voic, place, mann, freq]
+    '0': [ 0.0, -0.4,  0.0,  0.0,  0.0, -1.0],
+    '1': [ 0.0, -0.4,  0.0,  0.0,  0.0, -0.8],
+    '2': [ 0.0, -0.4,  0.0,  0.0,  0.0, -0.6],
+    '3': [ 0.0, -0.4,  0.0,  0.0,  0.0, -0.4],
+    '4': [ 0.0, -0.4,  0.0,  0.0,  0.0, -0.2],
+    '5': [ 0.0, -0.4,  0.0,  0.0,  0.0,  0.0],
+    '6': [ 0.0, -0.4,  0.0,  0.0,  0.0, +0.2],
+    '7': [ 0.0, -0.4,  0.0,  0.0,  0.0, +0.4],
+    '8': [ 0.0, -0.4,  0.0,  0.0,  0.0, +0.6],
+    '9': [ 0.0, -0.4,  0.0,  0.0,  0.0, +0.8],
+}
+
+
+def generate_qams_codebook(D=256, seed=42):
+    """
+    Generate character codebook from phonetic motion signatures.
+
+    Characters with similar phonetics get similar hypervectors.
+    Characters with different phonetics get dissimilar hypervectors.
+
+    Method: BLOCK-DIAGONAL basis — each of the 6 phonetic parameters
+    owns its own D/6 dimensions. This guarantees that flipping one
+    axis (e.g., voicing) only affects ~D/6 dimensions, leaving the
+    other 5D/6 identical.  A single-axis flip yields cosine ~0.67.
+
+    Cross-terms use a shared interaction block (remaining dims after
+    the 6 blocks) for parameter co-occurrence encoding.
+
+    Returns: dict mapping char -> bipolar np.ndarray of shape (D,)
+    """
+    rng = np.random.RandomState(seed)
+
+    n_params = 6
+    block_size = D // n_params       # 42 for D=256
+    remainder = D - block_size * n_params  # 4 extra dims
+
+    # Block-diagonal basis: each parameter gets its own random bipolar block
+    # basis[i] is nonzero only in dims [i*block_size : (i+1)*block_size]
+    basis_blocks = []
+    for i in range(n_params):
+        block = rng.choice([-1, 1], size=block_size).astype(np.float64)
+        basis_blocks.append(block)
+
+    # Cross-term interaction vectors: use the remainder dims + overlay
+    # These are full-D random vectors but weighted very lightly
+    cross_basis = []
+    for i in range(n_params - 1):
+        cv = rng.choice([-1, 1], size=D).astype(np.float64)
+        cross_basis.append(cv)
+
+    codebook = {}
+    for char, params in PHONETIC_SIGNATURES.items():
+        vec = np.zeros(D, dtype=np.float64)
+
+        # Block-diagonal linear terms: each param writes only to its block
+        for i in range(n_params):
+            start = i * block_size
+            end = start + block_size
+            vec[start:end] += params[i] * basis_blocks[i]
+
+        # Cross-terms: weak full-D overlay for parameter co-occurrence
+        for i in range(n_params - 1):
+            cross_weight = abs(params[i] * params[i + 1])
+            vec += cross_weight * cross_basis[i] * 0.1
+
+        # Character-specific noise for disambiguation
+        char_seed = abs(hash(char)) % (2**31)
+        char_rng = np.random.RandomState(char_seed)
+        noise = char_rng.choice([-1, 1], size=D).astype(np.float64)
+        vec += noise * 0.2
+
+        # Bipolarize
+        result = np.sign(vec)
+        result[result == 0] = 1.0
+        codebook[char] = result
+
+    return codebook
+
+
+def verify_phonetic_structure(codebook):
+    """
+    Print similarity matrix for key phonetic groups.
+    Verify that phonetically similar characters have similar vectors.
+    """
+    def cos_sim(a, b):
+        return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+
+    print("=== QAMS PHONETIC STRUCTURE VERIFICATION ===\n")
+
+    # Vowels should cluster
+    vowels = 'aeiou'
+    print("Vowel similarities (should be >0.3):")
+    for i in range(len(vowels)):
+        for j in range(i + 1, len(vowels)):
+            a, b = vowels[i], vowels[j]
+            sim = cos_sim(codebook[a], codebook[b])
+            print(f"  {a}-{b}: {sim:.3f}")
+
+    # Voiced/unvoiced pairs should be related
+    print("\nVoiced/unvoiced pairs (should be >0.4):")
+    pairs = [('b', 'p'), ('d', 't'), ('g', 'k'), ('v', 'f'), ('z', 's')]
+    for v, u in pairs:
+        sim = cos_sim(codebook[v], codebook[u])
+        print(f"  {v}-{u}: {sim:.3f}")
+
+    # Vowel vs consonant should be distant
+    print("\nVowel vs consonant (should be <0.2):")
+    cross = [('a', 't'), ('e', 'k'), ('i', 's'), ('o', 'p')]
+    for v, c in cross:
+        sim = cos_sim(codebook[v], codebook[c])
+        print(f"  {v}-{c}: {sim:.3f}")
+
+    # Silence group
+    print("\nSilence/punctuation (should be >0.5):")
+    silence = [' ', '.', ',', '\n']
+    for i in range(len(silence)):
+        for j in range(i + 1, len(silence)):
+            a, b = silence[i], silence[j]
+            sim = cos_sim(codebook[a], codebook[b])
+            label_a = repr(a)
+            label_b = repr(b)
+            print(f"  {label_a}-{label_b}: {sim:.3f}")
+
+    # Nasals should cluster
+    print("\nNasals m-n (should be >0.4):")
+    sim = cos_sim(codebook['m'], codebook['n'])
+    print(f"  m-n: {sim:.3f}")
+
+    print()
+
+
+if __name__ == "__main__":
+    codebook = generate_qams_codebook(D=256)
+    verify_phonetic_structure(codebook)
+
+    # Count unique vectors
+    print(f"Codebook size: {len(codebook)} characters")
+    print(f"Vector dimension: {len(list(codebook.values())[0])}")
+
+    # Show that ALL vectors are bipolar
+    all_bipolar = all(
+        set(np.unique(v)).issubset({-1.0, 1.0})
+        for v in codebook.values()
+    )
+    print(f"All vectors bipolar: {all_bipolar}")
