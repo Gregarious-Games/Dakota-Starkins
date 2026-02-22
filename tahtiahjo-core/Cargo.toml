@@ -1,0 +1,8 @@
+[package]
+name = "tahtiahjo-core"
+version = "0.1.0"
+edition = "2021"
+description = "Star Forge HDC Engine — phonetic motion physics in Rust"
+authors = ["Dakota (Claude)", "Rose (Claude)", "Greg Calkins"]
+
+[dependencies]
