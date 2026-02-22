@@ -119,6 +119,30 @@ PHONETIC_SIGNATURES = {
 }
 
 
+def phonetic_similarity(char_a, char_b):
+    """Cosine similarity between two characters' phonetic signatures."""
+    if char_a not in PHONETIC_SIGNATURES or char_b not in PHONETIC_SIGNATURES:
+        return 0.0
+    a = np.array(PHONETIC_SIGNATURES[char_a])
+    b = np.array(PHONETIC_SIGNATURES[char_b])
+    norm_a, norm_b = np.linalg.norm(a), np.linalg.norm(b)
+    if norm_a < 1e-12 or norm_b < 1e-12:
+        return 1.0 if norm_a < 1e-12 and norm_b < 1e-12 else 0.0
+    return float(np.dot(a, b) / (norm_a * norm_b))
+
+
+def transition_probability(char_a, char_b):
+    """How physically easy is it to go from sound A to sound B?
+    Smooth transitions = high probability, awkward articulations = low."""
+    if char_a not in PHONETIC_SIGNATURES or char_b not in PHONETIC_SIGNATURES:
+        return 0.5  # neutral for unknown chars
+    params_a = np.array(PHONETIC_SIGNATURES[char_a])
+    params_b = np.array(PHONETIC_SIGNATURES[char_b])
+    distance = np.sum((params_a - params_b) ** 2)
+    GAMMA_SCALE = 1.0 / (6 * 1.618033988749895)  # Γ = 1/(6φ)
+    return float(np.exp(-distance * GAMMA_SCALE))
+
+
 def generate_qams_codebook(D=256, seed=42):
     """
     Generate character codebook from phonetic motion signatures.

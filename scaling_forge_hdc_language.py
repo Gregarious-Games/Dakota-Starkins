@@ -27,7 +27,10 @@ from scaling_forge_hdc_v1 import (
     CLAMP_HIGH, PHI, GAMMA, TAU,
     random_unit_vector, clamp_vector, HDC_DIM, _hdc,
 )
-from qams_codebook import generate_qams_codebook, PHONETIC_SIGNATURES
+from qams_codebook import (
+    generate_qams_codebook, PHONETIC_SIGNATURES,
+    phonetic_similarity, transition_probability,
+)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # CONSTANTS
@@ -143,26 +146,34 @@ class HDCTokenizer:
 
         return self.hdc.bundle(bindings)
 
-    def decode_next_char(self, output_vec, prototypes=None):
+    def decode_next_char(self, output_vec, prototypes=None, prev_char=None, alpha=0.15):
         """
         Find the nearest entry by cosine similarity.
 
         If prototypes provided, search those (for trained decoding).
         Otherwise search char_codebook (for roundtrip test).
 
+        Layer 3 (multiplicative): When prev_char is provided, weight by
+        articulatory transition probability. Smooth transitions get a bonus.
+
         Returns: (predicted_char, similarity_score)
         """
         search = prototypes if prototypes is not None else self.char_codebook
         best_char = ' '
-        best_sim = -2.0
+        best_score = -2.0
 
         for c, vec in search.items():
             sim = self.hdc.similarity(output_vec, vec)
-            if sim > best_sim:
-                best_sim = sim
+            if prev_char is not None:
+                trans = transition_probability(prev_char, c)
+                score = sim * (1.0 - alpha) + trans * alpha
+            else:
+                score = sim
+            if score > best_score:
+                best_score = score
                 best_char = c
 
-        return best_char, best_sim
+        return best_char, best_score
 
     def decode_position(self, composite, position):
         """Unbind a specific position from a composite vector."""
@@ -210,10 +221,15 @@ class SwarmLanguageModel:
     Training: Hebbian codebook adjustment (no backprop).
     """
 
+    # Phonetic axis-to-node mapping: 5 nodes, 6 params, skip duration (axis 1)
+    PHONETIC_AXES = ["aperture", "duration", "voicing", "place", "manner", "frequency"]
+    AXIS_MAP = [0, 2, 3, 4, 5]  # skip duration — implicit in position binding
+
     def __init__(self, n_nodes=N_NODES, context_window=CONTEXT_WINDOW,
                  swarm_steps=SWARM_STEPS, dim=D,
                  output_strategy="centroid", seed=42,
-                 codebook_mode="random", language="english"):
+                 codebook_mode="random", language="english",
+                 phonetic_mode=False):
         self.n_nodes = n_nodes
         self.context_window = context_window
         self.swarm_steps = swarm_steps
@@ -222,6 +238,8 @@ class SwarmLanguageModel:
         self.seed = seed
         self.codebook_mode = codebook_mode
         self.language = language
+        self.phonetic_mode = phonetic_mode
+        self.prev_char = None  # for transition priors (Layer 3)
 
         # Tokenizer
         self.tokenizer = HDCTokenizer(dim=dim, context_window=context_window,
@@ -257,6 +275,43 @@ class SwarmLanguageModel:
             node.Z = permuted.copy()
             node.X1 = permuted.copy()
             node._update_z_scalar()
+
+    def _inject_input_phonetic(self, input_vec):
+        """
+        Layer 1: Phonetic Coupling — each node specializes in one phonetic axis.
+
+        Instead of uniform Weyl permutation, inject input with axis-weighted
+        emphasis. Each node's specialty QAMS block is amplified 2x.
+        """
+        block_size = self.dim // 6  # 42 for D=256
+        for i, node in enumerate(self.nodes):
+            view = input_vec.copy()
+            # Amplify this node's specialty block
+            axis = self.AXIS_MAP[i]
+            start, end = axis * block_size, (axis + 1) * block_size
+            view[start:end] *= 2.0
+            node.Z = view.copy()
+            node.X1 = view.copy()
+            node._update_z_scalar()
+
+    def _input_phonetic_coherence(self, text_window):
+        """
+        Layer 4: Measure how phonetically consistent the input window is.
+
+        Coherent = all characters share phonetic properties (e.g., all vowels).
+        Returns: 0.0 (maximally diverse) to 1.0 (maximally coherent).
+        """
+        params = []
+        for c in text_window:
+            c = self.tokenizer._casefold(c)
+            if c in PHONETIC_SIGNATURES:
+                params.append(PHONETIC_SIGNATURES[c])
+        if len(params) < 2:
+            return 0.5
+        params = np.array(params)
+        mean_params = params.mean(axis=0)
+        variance = np.mean((params - mean_params) ** 2)
+        return float(np.exp(-variance * 2.0))
 
     def _run_swarm_steps(self):
         """
@@ -333,6 +388,9 @@ class SwarmLanguageModel:
         """
         Full forward pass: encode -> inject -> swarm -> read -> decode.
 
+        When phonetic_mode=True, uses phonetic coupling (Layer 1) for injection
+        and transition priors (Layer 3) for decoding.
+
         Args:
             text_window: string of length context_window
 
@@ -341,8 +399,11 @@ class SwarmLanguageModel:
         # Encode input
         input_vec = self.tokenizer.encode(text_window)
 
-        # Inject into swarm
-        self._inject_input(input_vec)
+        # Inject into swarm — Layer 1: phonetic coupling
+        if self.phonetic_mode:
+            self._inject_input_phonetic(input_vec)
+        else:
+            self._inject_input(input_vec)
 
         # Run swarm dynamics
         self._run_swarm_steps()
@@ -350,10 +411,17 @@ class SwarmLanguageModel:
         # Read output
         output_vec = self._read_output()
 
-        # Decode to character using learned output prototypes
-        pred_char, confidence = self.tokenizer.decode_next_char(
-            output_vec, prototypes=self.output_prototypes
-        )
+        # Decode to character — Layer 3: transition priors
+        if self.phonetic_mode:
+            pred_char, confidence = self.tokenizer.decode_next_char(
+                output_vec, prototypes=self.output_prototypes,
+                prev_char=self.prev_char, alpha=0.15
+            )
+            self.prev_char = pred_char
+        else:
+            pred_char, confidence = self.tokenizer.decode_next_char(
+                output_vec, prototypes=self.output_prototypes
+            )
 
         return pred_char, confidence, output_vec
 
@@ -365,6 +433,10 @@ class SwarmLanguageModel:
           - Correct: pull target codebook vec toward output (reinforce)
           - Wrong: push predicted vec away from output, pull target toward it
           - Comfort: correct warms swarm, wrong cools it
+
+        Multiplicative layers (when phonetic_mode=True):
+          - Layer 2: Phonetic neighborhoods — partial credit for close misses
+          - Layer 4: Coherence-scaled comfort — coherent contexts amplify feedback
 
         Args:
             context: string of length context_window
@@ -393,29 +465,63 @@ class SwarmLanguageModel:
         else:
             output_normed = output_vec
 
+        # Layer 4: Compute phonetic coherence of input context
+        if self.phonetic_mode:
+            coherence = self._input_phonetic_coherence(context)
+        else:
+            coherence = 0.5  # neutral default
+
         if correct:
             # Reinforce: pull target prototype toward output (exponential moving average)
             self.output_prototypes[target_char] = (
                 (1.0 - lr) * target_proto + lr * output_normed
             )
-            # Warm the swarm
+            # Warm the swarm — Layer 4: coherent correct = bigger reward
+            comfort_bonus = 0.05 * (0.5 + coherence) if self.phonetic_mode else 0.05
+            heat_bonus = 0.02 * (0.5 + coherence) if self.phonetic_mode else 0.02
             for node in self.nodes:
-                node.heat_valence = min(1.0, node.heat_valence + 0.02)
-                node.comfort = min(1.0, node.comfort + 0.05)
+                node.heat_valence = min(1.0, node.heat_valence + heat_bonus)
+                node.comfort = min(1.0, node.comfort + comfort_bonus)
         else:
-            # Pull target prototype toward output
-            self.output_prototypes[target_char] = (
-                (1.0 - lr) * target_proto + lr * output_normed
-            )
-            # Push wrong prediction's prototype away from output
-            pred_proto = self.output_prototypes[pred_char]
-            self.output_prototypes[pred_char] = (
-                (1.0 + lr * 0.3) * pred_proto - lr * 0.3 * output_normed
-            )
-            # Cool the swarm
-            for node in self.nodes:
-                node.heat_valence = max(0.0, node.heat_valence - 0.01)
-                node.comfort = max(0.0, node.comfort - 0.02)
+            # Layer 2: Phonetic neighborhoods — partial credit for close misses
+            if self.phonetic_mode:
+                phon_sim = phonetic_similarity(pred_char, target_char)
+                # Half credit scaled by phonetic closeness
+                # (prototype still pulled toward target regardless)
+
+                # Pull target prototype toward output
+                self.output_prototypes[target_char] = (
+                    (1.0 - lr) * target_proto + lr * output_normed
+                )
+
+                # Gentle correction for close misses, strong for far misses
+                push_scale = 0.3 * (1.0 - phon_sim)
+                pred_proto = self.output_prototypes[pred_char]
+                self.output_prototypes[pred_char] = (
+                    (1.0 + lr * push_scale) * pred_proto - lr * push_scale * output_normed
+                )
+
+                # Comfort penalty scaled by phonetic distance and coherence
+                comfort_delta = -0.02 * (1.0 - phon_sim) * (0.5 + coherence)
+                heat_delta = -0.01 * (1.0 - phon_sim) * (0.5 + coherence)
+                for node in self.nodes:
+                    node.heat_valence = max(0.0, node.heat_valence + heat_delta)
+                    node.comfort = max(0.0, node.comfort + comfort_delta)
+            else:
+                # Original binary penalty
+                # Pull target prototype toward output
+                self.output_prototypes[target_char] = (
+                    (1.0 - lr) * target_proto + lr * output_normed
+                )
+                # Push wrong prediction's prototype away from output
+                pred_proto = self.output_prototypes[pred_char]
+                self.output_prototypes[pred_char] = (
+                    (1.0 + lr * 0.3) * pred_proto - lr * 0.3 * output_normed
+                )
+                # Cool the swarm
+                for node in self.nodes:
+                    node.heat_valence = max(0.0, node.heat_valence - 0.01)
+                    node.comfort = max(0.0, node.comfort - 0.02)
 
         # Reset transient state for next prediction
         self._reset_nodes()
@@ -444,6 +550,10 @@ class SwarmLanguageModel:
             text = ' ' * (self.context_window - len(text)) + text
 
         generated = list(text)
+
+        # Initialize prev_char for transition priors during generation
+        if self.phonetic_mode and len(text) > 0:
+            self.prev_char = self.tokenizer._casefold(text[-1])
 
         for _ in range(length):
             window = ''.join(generated[-self.context_window:])
@@ -692,15 +802,18 @@ def test_pattern_learning():
     return passed
 
 
-def test_shakespeare(max_chars=50000, codebook_mode="random", language="english"):
+def test_shakespeare(max_chars=50000, codebook_mode="random", language="english",
+                     phonetic_mode=False):
     """Test 4: Train on corpus, report accuracy curve + generate."""
     lang_label = language.capitalize()
+    mode_label = "multiplicative" if phonetic_mode else codebook_mode
     print("\n" + "="*60)
-    print(f"  TEST 4: {lang_label} Training (codebook={codebook_mode})")
+    print(f"  TEST 4: {lang_label} Training (codebook={codebook_mode}, mode={mode_label})")
     print("="*60)
 
     model = SwarmLanguageModel(n_nodes=N_NODES, swarm_steps=SWARM_STEPS,
-                               codebook_mode=codebook_mode, language=language)
+                               codebook_mode=codebook_mode, language=language,
+                               phonetic_mode=phonetic_mode)
     results = model.train_shakespeare(max_chars=max_chars)
 
     n_chars = len(model.tokenizer.chars)
@@ -740,6 +853,82 @@ def _print_comparison(title, random_results, qams_results, language="english"):
     print(f"  QAMS sample:   {repr(qams_results['generated_sample'][:100])}")
 
 
+def _print_3way_comparison(title, random_res, additive_res, mult_res, language="english"):
+    """Print formatted 3-way comparison: random vs QAMS-additive vs QAMS-multiplicative."""
+    print("\n" + "="*70)
+    print(f"  {title} ({language.capitalize()})")
+    print("="*70)
+
+    r_acc = random_res['final_accuracy']
+    a_acc = additive_res['final_accuracy']
+    m_acc = mult_res['final_accuracy']
+
+    print(f"  Random codebook:        {r_acc:.4f} ({r_acc*100:.1f}%)")
+    print(f"  QAMS additive:          {a_acc:.4f} ({a_acc*100:.1f}%)")
+    print(f"  QAMS multiplicative:    {m_acc:.4f} ({m_acc*100:.1f}%)")
+
+    add_gap = a_acc - r_acc
+    mult_gap = m_acc - r_acc
+    print(f"  Additive gap:           {add_gap:+.4f} ({add_gap*100:+.1f}%)")
+    print(f"  Multiplicative gap:     {mult_gap:+.4f} ({mult_gap*100:+.1f}%)")
+
+    if abs(add_gap) > 1e-6:
+        mult_ratio = mult_gap / add_gap
+        print(f"  Multiplication ratio:   {mult_ratio:.2f}x")
+        if mult_ratio > 2.0:
+            print(f"  >> HYPOTHESIS CONFIRMED: multiplicative > 2x additive gap")
+        elif mult_ratio > 1.0:
+            print(f"  >> Multiplicative > additive, but < 2x threshold")
+        else:
+            print(f"  >> Multiplicative not yet outperforming additive")
+    else:
+        print(f"  Multiplication ratio:   N/A (additive gap near zero)")
+
+    # Early accuracy comparison
+    if random_res['history'] and additive_res['history'] and mult_res['history']:
+        r_early = random_res['history'][0]['accuracy']
+        a_early = additive_res['history'][0]['accuracy']
+        m_early = mult_res['history'][0]['accuracy']
+        print(f"\n  Early accuracy (step 1000):")
+        print(f"    Random:               {r_early:.4f}")
+        print(f"    Additive:             {a_early:.4f}")
+        print(f"    Multiplicative:       {m_early:.4f}")
+
+    print(f"\n  Random sample:          {repr(random_res['generated_sample'][:100])}")
+    print(f"  Additive sample:        {repr(additive_res['generated_sample'][:100])}")
+    print(f"  Multiplicative sample:  {repr(mult_res['generated_sample'][:100])}")
+
+
+def test_multiplicative_vs_additive(max_chars=10000, language="english"):
+    """
+    3-way comparison: random vs QAMS-additive vs QAMS-multiplicative.
+
+    Reports final accuracy, early accuracy, generated samples,
+    and the multiplication ratio (mult_gap / additive_gap).
+    """
+    print("\n" + "="*70)
+    print(f"  MULTIPLICATIVE QAMS COMPARISON ({language.capitalize()})")
+    print(f"  3-way: Random vs QAMS-Additive vs QAMS-Multiplicative")
+    print("="*70)
+
+    print("\n--- 1/3: RANDOM CODEBOOK (baseline) ---")
+    _, random_res = test_shakespeare(max_chars=max_chars, codebook_mode="random",
+                                     language=language, phonetic_mode=False)
+
+    print("\n--- 2/3: QAMS ADDITIVE (physics at input only) ---")
+    _, additive_res = test_shakespeare(max_chars=max_chars, codebook_mode="qams",
+                                       language=language, phonetic_mode=False)
+
+    print("\n--- 3/3: QAMS MULTIPLICATIVE (physics at every layer) ---")
+    _, mult_res = test_shakespeare(max_chars=max_chars, codebook_mode="qams",
+                                   language=language, phonetic_mode=True)
+
+    _print_3way_comparison("MULTIPLICATIVE COMPARISON RESULTS",
+                           random_res, additive_res, mult_res, language)
+
+    return random_res, additive_res, mult_res
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════
@@ -747,13 +936,14 @@ def _print_comparison(title, random_results, qams_results, language="english"):
 if __name__ == "__main__":
     print("="*70)
     print("  SCALING FORGE HDC LANGUAGE — Project Karpathy")
-    print("  Step 4: HDC Tokenizer + Swarm Language Model")
+    print("  Step 5: Multiplicative QAMS — Physics at Every Layer")
     print("="*70)
 
     # Parse CLI args
     codebook_mode = "random"
     max_chars = 50000
     language = "english"
+    phonetic_mode = False
     for arg in sys.argv:
         if arg.startswith("--codebook="):
             codebook_mode = arg.split("=")[1]
@@ -761,6 +951,8 @@ if __name__ == "__main__":
             max_chars = int(arg.split("=")[1])
         if arg.startswith("--language="):
             language = arg.split("=")[1]
+        if arg == "--multiplicative":
+            phonetic_mode = True
 
     results = {}
 
@@ -776,10 +968,10 @@ if __name__ == "__main__":
     # Test 4: Corpus training (optional — slow)
     if "--shakespeare" in sys.argv or "--full" in sys.argv:
         passed, _ = test_shakespeare(max_chars=max_chars, codebook_mode=codebook_mode,
-                                     language=language)
+                                     language=language, phonetic_mode=phonetic_mode)
         results["corpus_training"] = passed
 
-    # Test 5: QAMS vs Random comparison (optional)
+    # Test 5: QAMS vs Random comparison (optional — additive only)
     if "--compare" in sys.argv:
         print("\n" + "="*70)
         print(f"  COMPARISON: Random vs QAMS Codebook ({language.capitalize()})")
@@ -837,6 +1029,18 @@ if __name__ == "__main__":
         results["fi_random"] = fi_random['final_accuracy'] > 1.0 / n_fi
         results["fi_qams"] = fi_qams['final_accuracy'] > 1.0 / n_fi
         results["en_qams"] = en_qams['final_accuracy'] > 1.0 / len(ALPHABET_EN)
+
+    # Test 7: Multiplicative QAMS 3-way comparison (optional)
+    if "--compare-mult" in sys.argv:
+        random_res, additive_res, mult_res = test_multiplicative_vs_additive(
+            max_chars=max_chars, language=language
+        )
+
+        n_chars = len(ALPHABET_FI if language == "finnish" else ALPHABET_EN)
+        baseline = 1.0 / n_chars
+        results["mult_random"] = random_res['final_accuracy'] > baseline
+        results["mult_additive"] = additive_res['final_accuracy'] > baseline
+        results["mult_multiplicative"] = mult_res['final_accuracy'] > baseline
 
     # Summary
     print("\n" + "="*70)
