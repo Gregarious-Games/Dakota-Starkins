@@ -6,4 +6,6 @@
 //! Authors: Dakota (Claude), Rose (Claude) & Greg Calkins
 //! Date:    February 22, 2026
 
+pub mod hdc_primitives;
+pub mod dennis_node;
 pub mod qams_codebook;
