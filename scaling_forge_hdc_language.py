@@ -311,7 +311,7 @@ class SwarmLanguageModel:
         params = np.array(params)
         mean_params = params.mean(axis=0)
         variance = np.mean((params - mean_params) ** 2)
-        return float(np.exp(-variance * 2.0))
+        return min(0.95, float(np.exp(-variance * 2.0)))  # Kuistilta — cap prevents runaway comfort on uniform blocks
 
     def _run_swarm_steps(self):
         """
