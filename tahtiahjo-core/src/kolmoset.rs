@@ -212,13 +212,17 @@ impl ReleSolmu {
     }
 
     /// Retrain pass on given samples.
+    ///
+    /// Learning rate: 1/(1 + pass × φ) — decays slower than τ^pass.
+    /// τ^10 = 0.006 (dead), 1/(1+10φ) = 0.058 (still meaningful).
+    /// Keeps later relay retrain passes productive.
     pub fn uudelleenkouluta(
         &mut self,
         näytteet: &[(Vec<f64>, char)],
         hdc: &HdcPeruskäsitteet,
         kierros: usize,
     ) -> f64 {
-        let lr = TAU.powi(kierros as i32);
+        let lr = 1.0 / (1.0 + kierros as f64 * PHI);
         let mut oikein = 0usize;
 
         for (konteksti, &kohde) in näytteet.iter().map(|(k, c)| (k, c)) {
@@ -425,16 +429,39 @@ impl Kolmoset {
         (paras_merkki, paras_piste)
     }
 
-    /// Retrain: each node retrains on all samples.
+    /// Relay retrain: cascade corrections through the relay.
+    ///
+    /// Instead of all three nodes retraining independently,
+    /// the corrections flow through the relay:
+    ///   A retrains → dump to B → B retrains → dump to C → C retrains
+    ///
+    /// This extends the relay's knowledge-transfer advantage into
+    /// the retraining phase. Each downstream node benefits from
+    /// the upstream node's corrections before making its own.
+    ///
+    /// Learning rate: 1/(1 + pass × φ) — slower decay than τ^pass,
+    /// keeps later passes meaningful while preventing oscillation.
     pub fn uudelleenkouluta(
         &mut self,
         näytteet: &[(Vec<f64>, char)],
         hdc: &HdcPeruskäsitteet,
         kierros: usize,
     ) -> f64 {
+        // A retrains
         let ta = self.a.uudelleenkouluta(näytteet, hdc, kierros);
+        // A dumps corrections to B
+        muisti_kaato(&self.a, &mut self.b);
+
+        // B retrains (starting from A's improved state)
         let tb = self.b.uudelleenkouluta(näytteet, hdc, kierros);
+        // B dumps corrections to C
+        muisti_kaato(&self.b, &mut self.c);
+
+        // C retrains (starting from B's improved state, which includes A's)
         let tc = self.c.uudelleenkouluta(näytteet, hdc, kierros);
+        // C dumps back to A (complete the cycle for next pass)
+        muisti_kaato(&self.c, &mut self.a);
+
         // Return weighted average
         let pa = self.a.luottamus();
         let pb = self.b.luottamus();
