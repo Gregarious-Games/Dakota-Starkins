@@ -144,6 +144,35 @@ impl Hormonit {
             self.näkörauhanen = (askel as f64 / kokonais_askeleet as f64).min(1.0);
         }
     }
+
+    /// Multi-Phase Maturation Cascade (Rank 9)
+    ///
+    /// Octopus optic gland biology: the optic gland undergoes
+    /// dramatic molecular changes across distinct behavioral stages.
+    /// Each phase has unique neurochemical profiles. Irreversible.
+    ///
+    /// Phase 1: Exploration (0-25%)  — high curiosity, broad learning
+    /// Phase 2: Foraging   (25-50%) — balanced, focused learning
+    /// Phase 3: Specialization (50-80%) — stability, precision refinement
+    /// Phase 4: Crystallization (80-100%) — minimal learning, inference
+    pub fn kypsy_kaskadi(&mut self, askel: usize, kokonais: usize) {
+        if kokonais == 0 { return; }
+        let edistyminen = (askel as f64 / kokonais as f64).min(1.0);
+        self.näkörauhanen = edistyminen;
+
+        if edistyminen < 0.25 {
+            // Exploration: boost dopamine (curiosity drive)
+            self.dopamiini = (self.dopamiini + 0.02).min(1.0);
+        } else if edistyminen < 0.50 {
+            // Foraging: balanced — no extra modulation
+        } else if edistyminen < 0.80 {
+            // Specialization: increase serotonin (stability)
+            self.serotoniini = 0.998 * self.serotoniini + 0.002;
+        } else {
+            // Crystallization: reduce cortisol, maximize stability
+            self.kortisoli *= 0.95;
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -635,31 +664,74 @@ impl Kaksoset {
         // 4. Myöntö always accumulates into the CORRECT class
         self.myöntö.kerrytä(kohde, &suodatettu, lr);
 
-        // 5. Predict using current state
-        let (ennuste, _luottamus) = self.ennusta(konteksti, hdc);
+        // 5. Predict using current state — get full score breakdown
+        //    for precision-weighted error learning (Active Inference, Rank 2)
+        let pisteet = self.pisteet_erittely(konteksti, hdc);
+        let ennuste = if pisteet.is_empty() { ' ' } else { pisteet[0].0 };
         let oikein = ennuste == kohde;
+
+        // ── ENAQT Goldilocks Dephasing (Rank 1) ──────────────────
+        // Quantum biology: photosynthetic FMO complexes achieve max
+        // transport at INTERMEDIATE dephasing. Too little noise →
+        // stuck in local states. Too much → coherence destroyed.
+        // Peak anti-learning when HRV coherence ≈ 0.5.
+        let koherenssi_taso = self.sydän.hrv_koherenssi;
+        let goldilocks = 4.0 * koherenssi_taso * (1.0 - koherenssi_taso);
+        let enaqt_kerroin = 0.3 + 0.7 * goldilocks; // [0.3, 1.0]
+
+        // ── Precision-Weighted Error (Rank 2) ─────────────────────
+        // Active Inference: weight errors by confidence margin.
+        // High-confidence wrong = highly informative → learn hard.
+        // Low-confidence wrong = ambiguous → learn gently.
+        let precision = if pisteet.len() >= 2 {
+            let margin = (pisteet[0].3 - pisteet[1].3).abs();
+            1.0 / (1.0 + (-margin * 3.0_f64).exp()) // sigmoid
+        } else {
+            0.5
+        };
+        let precision_lr = lr * (0.2 + 0.8 * precision);
 
         if oikein {
             self.oikein += 1;
             self.hormonit.palkitse();
         } else {
+            // ── CORE: Original hormonal response (preserved) ──────
             self.hormonit.rankaise();
 
-            // 6. Kielto anti-learns: accumulate into the WRONG class
-            // "This context looked like <ennuste> but was actually <kohde>"
-            // So we add to kielto[ennuste] — strengthening the anti-prototype
-            // for the confused character.
-            self.kielto.kerrytä(ennuste, &suodatettu, lr * 0.5);
+            // ── Kielto anti-learning (modulated by ENAQT + precision) ──
+            // Base Kielto rates preserved, MULTIPLIED by bio modulation.
+            //
+            // ENAQT (Rank 1): Goldilocks dephasing — peak anti-learning
+            // at intermediate coherence. enaqt_kerroin ∈ [0.3, 1.0].
+            //
+            // Precision (Rank 2): confident errors are more informative.
+            // Modulates within [0.8, 1.2] — gentle boost, no collapse.
+            let prec_mod = 0.8 + 0.4 * precision; // [0.8, 1.2]
+            let kielto_mod = enaqt_kerroin * prec_mod;
+            self.kielto.kerrytä(ennuste, &suodatettu, lr * 0.5 * kielto_mod);
+            self.kielto.vähennä(kohde, &suodatettu, lr * 0.3 * kielto_mod);
 
-            // Also subtract from kielto[kohde] — the correct answer
-            // should NOT be suppressed.
-            self.kielto.vähennä(kohde, &suodatettu, lr * 0.3);
+            // ── Phase Conjugate Error Correction (Rank 10) ────────
+            // Nonlinear optics: targeted correction in dimensions that
+            // distinguish correct from wrong. Only for confident errors
+            // (precision > 0.6) to avoid noisy corrections.
+            if precision > 0.6 {
+                let oikea_proto = self.myöntö.prototyypit.get(&kohde);
+                let väärä_proto = self.myöntö.prototyypit.get(&ennuste);
+                if let (Some(oikea), Some(väärä)) = (oikea_proto, väärä_proto) {
+                    let konjugaatti: Vec<f64> = suodatettu.iter()
+                        .zip(oikea.iter().zip(väärä.iter()))
+                        .map(|(&k, (&o, &v))| k * (o - v))
+                        .collect();
+                    let konj_lr = lr * GAMMA * 0.3; // very gentle
+                    self.kielto.kerrytä(ennuste, &konjugaatti, konj_lr);
+                }
+            }
         }
 
         // 7. Check twin agreement
         let myöntö_ennuste = self.myöntö.paras_vastaavuus(konteksti, hdc).0;
         let kielto_pahin = self.kielto.paras_vastaavuus(konteksti, hdc).0;
-        // Twins "agree" when Myöntö's best is NOT Kielto's worst
         if myöntö_ennuste != kielto_pahin {
             self.hormonit.kaksoset_sopivat();
         } else {
@@ -673,8 +745,11 @@ impl Kaksoset {
         // 9. Hormonal decay
         self.hormonit.rapaudu();
 
-        // 10. Maturation
-        self.hormonit.kypsy(self.askel, self.askel + 10000);
+        // 10. Multi-Phase Maturation Cascade (Rank 9)
+        //     Optic gland biology: exploration → foraging →
+        //     specialization → crystallization. Irreversible stages
+        //     with distinct neurochemical profiles.
+        self.hormonit.kypsy_kaskadi(self.askel, self.askel + 10000);
 
         KoulutaTulos {
             ennuste,
@@ -717,6 +792,90 @@ impl Kaksoset {
         }
 
         if yhteensä > 0 { oikein as f64 / yhteensä as f64 } else { 0.0 }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // DREAM PHASE — Octopus Active Sleep (Rank 4)
+    // ═══════════════════════════════════════════════════════════
+    //
+    // Nature 2023 (Pavan et al.): Octopuses have two-stage sleep
+    // remarkably similar to vertebrate REM/non-REM.
+    //
+    // Quiet sleep: brain waves resemble mammalian sleep spindles
+    //   → memory consolidation through NORMALIZATION
+    //
+    // Active sleep: chromatophore patterns replay waking-life
+    //   skin patterns → neural replay of stored contexts
+    //
+    // Every ~60 seconds, octopuses cycle between these states.
+    // Chromatophore patterns during active sleep are conserved
+    // across individuals, suggesting structured memory rehearsal.
+
+    /// Dream phase: two-stage memory consolidation.
+    ///
+    /// Stage 1 (Quiet Sleep): Normalize all prototypes to prevent
+    /// magnitude drift. Frequent characters accumulate massive norms,
+    /// which corrupts cosine similarity rankings. Normalization
+    /// restores fair comparison — like sleep spindle compression.
+    ///
+    /// Stage 2 (Active Sleep): Replay random subset of training
+    /// contexts with noise injection. Noisy replay acts as natural
+    /// regularization (similar to dropout in neural networks) and
+    /// strengthens generalizable patterns while washing out noise.
+    pub fn uni_vaihe(
+        &mut self,
+        näytteet: &[(Vec<f64>, char)],
+        siemen: &mut crate::hdc_primitives::Siemen,
+    ) {
+        let ulottuvuus = if let Some(v) = self.myöntö.prototyypit.values().next() {
+            v.len()
+        } else {
+            return;
+        };
+        let kohde_normi = (ulottuvuus as f64).sqrt();
+
+        // ── QUIET SLEEP: soft prototype normalization ─────────────
+        // Sleep spindle-like compression: BLEND prototypes toward
+        // uniform magnitude. τ (0.618) blend preserves learned
+        // magnitude differences while reducing drift.
+        // Gentle: current * τ + normalized * (1-τ)
+        for proto in self.myöntö.prototyypit.values_mut() {
+            let normi: f64 = proto.iter().map(|x| x * x).sum::<f64>().sqrt();
+            if normi > 1e-12 {
+                let kerroin = kohde_normi / normi;
+                for p in proto.iter_mut() {
+                    *p = *p * TAU + (*p * kerroin) * (1.0 - TAU);
+                }
+            }
+        }
+        // Also soften Kielto prototypes
+        for proto in self.kielto.prototyypit.values_mut() {
+            let normi: f64 = proto.iter().map(|x| x * x).sum::<f64>().sqrt();
+            if normi > 1e-12 {
+                let kerroin = kohde_normi / normi;
+                for p in proto.iter_mut() {
+                    *p = *p * TAU + (*p * kerroin) * (1.0 - TAU);
+                }
+            }
+        }
+
+        // ── ACTIVE SLEEP: noisy replay ───────────────────────────
+        // Replay 10% of training samples with noise injection.
+        // Chromatophore-like perturbation: jitter context vectors
+        // to strengthen generalizable patterns.
+        if näytteet.is_empty() { return; }
+        let replay_n = (näytteet.len() / 10).max(1);
+        for _ in 0..replay_n {
+            let idx = (siemen.tasainen_01() * näytteet.len() as f64) as usize;
+            let idx = idx.min(näytteet.len() - 1);
+            let (konteksti, kohde) = &näytteet[idx];
+            // Add dream noise (chromatophore perturbation)
+            let noisy: Vec<f64> = konteksti.iter()
+                .map(|&x| x + siemen.tasainen_symmetrinen(0.1))
+                .collect();
+            // Gentle reinforcement — dream learning rate
+            self.myöntö.kerrytä(*kohde, &noisy, 0.1);
+        }
     }
 
     // ═══════════════════════════════════════════════════════════

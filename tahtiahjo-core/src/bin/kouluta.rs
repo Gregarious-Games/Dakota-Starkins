@@ -9,11 +9,13 @@
 //!   --window=N        Context window size (default: 3)
 //!   --codebook=TYPE   random | qams (default: qams)
 //!   --kaksoset        Use twin accumulator with heart/membrane physics
-//!   --compare         Run LuokkaKertymä vs Kaksoset side-by-side
+//!   --kolmoset        Use triple relay cascade (A→B→C→A)
+//!   --compare         Run all architectures side-by-side
 //!
 //! Examples:
 //!   cargo run --release --bin kouluta -- ../kalevala.txt --chars=10000 --codebook=qams
 //!   cargo run --release --bin kouluta -- ../kalevala.txt --kaksoset
+//!   cargo run --release --bin kouluta -- ../kalevala.txt --kolmoset
 //!   cargo run --release --bin kouluta -- ../kalevala.txt --compare
 
 use std::collections::HashMap;
@@ -25,6 +27,7 @@ use tahtiahjo_core::konteksti_sitoja::KontekstiSitoja;
 use tahtiahjo_core::luokka_kertyma::{LuokkaKertymä, luo_satunnainen_koodikirja};
 use tahtiahjo_core::qams_codebook::{kaikki_allekirjoitukset, luo_koodikirja};
 use tahtiahjo_core::kaksoset::Kaksoset;
+use tahtiahjo_core::kolmoset::Kolmoset;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -39,6 +42,7 @@ fn main() {
     let mut ikkuna: usize = 3;
     let mut koodikirja_tyyppi = "qams".to_string();
     let mut käytä_kaksoset = false;
+    let mut käytä_kolmoset = false;
     let mut vertaa = false;
 
     for arg in &args[2..] {
@@ -52,6 +56,8 @@ fn main() {
             koodikirja_tyyppi = val.to_string();
         } else if arg == "--kaksoset" {
             käytä_kaksoset = true;
+        } else if arg == "--kolmoset" {
+            käytä_kolmoset = true;
         } else if arg == "--compare" {
             vertaa = true;
         }
@@ -75,7 +81,9 @@ fn main() {
     println!("  Retrain:    {} passes", uudelleen);
     println!("  Dimension:  D={}", ULOTTUVUUS);
     if vertaa {
-        println!("  Mode:       COMPARE (LuokkaKertymä vs Kaksoset)");
+        println!("  Mode:       COMPARE (all architectures)");
+    } else if käytä_kolmoset {
+        println!("  Mode:       KOLMOSET (triple relay cascade)");
     } else if käytä_kaksoset {
         println!("  Mode:       KAKSOSET (twin accumulator)");
     } else {
@@ -107,12 +115,15 @@ fn main() {
 
     if vertaa {
         // ═══════════════════════════════════════════════════════════════
-        // COMPARE MODE: run both pipelines side-by-side
+        // COMPARE MODE: run all architectures side-by-side
         // ═══════════════════════════════════════════════════════════════
         let tarkkuus_lk = kouluta_luokkakertymä(
             &teksti, &koodikirja, &sitoja, &mut hdc, uudelleen,
         );
         let tarkkuus_kk = kouluta_kaksoset(
+            &teksti, &koodikirja, &sitoja, &mut hdc, uudelleen,
+        );
+        let tarkkuus_km = kouluta_kolmoset(
             &teksti, &koodikirja, &sitoja, &mut hdc, uudelleen,
         );
 
@@ -121,15 +132,26 @@ fn main() {
         println!("───────────────────────────────────────────────────────────────");
         println!("  LuokkaKertymä:  {:.2}%", tarkkuus_lk * 100.0);
         println!("  Kaksoset:       {:.2}%", tarkkuus_kk * 100.0);
-        let ero = (tarkkuus_kk - tarkkuus_lk) * 100.0;
-        if ero > 0.0 {
-            println!("  Kaksoset wins:  +{:.2}%", ero);
-        } else if ero < 0.0 {
-            println!("  LuokkaKertymä wins: {:.2}%", ero);
+        println!("  Kolmoset:       {:.2}%", tarkkuus_km * 100.0);
+        let paras = tarkkuus_lk.max(tarkkuus_kk).max(tarkkuus_km);
+        if paras == tarkkuus_km {
+            println!("  >>> Kolmoset wins: +{:.2}% over LuokkaKertymä",
+                (tarkkuus_km - tarkkuus_lk) * 100.0);
+        } else if paras == tarkkuus_kk {
+            println!("  >>> Kaksoset wins: +{:.2}% over LuokkaKertymä",
+                (tarkkuus_kk - tarkkuus_lk) * 100.0);
         } else {
-            println!("  Tie");
+            println!("  >>> LuokkaKertymä wins");
         }
         println!("═══════════════════════════════════════════════════════════════");
+    } else if käytä_kolmoset {
+        // ═══════════════════════════════════════════════════════════════
+        // KOLMOSET MODE
+        // ═══════════════════════════════════════════════════════════════
+        let tarkkuus = kouluta_kolmoset(
+            &teksti, &koodikirja, &sitoja, &mut hdc, uudelleen,
+        );
+        tulosta_lopputulos(tarkkuus);
     } else if käytä_kaksoset {
         // ═══════════════════════════════════════════════════════════════
         // KAKSOSET MODE
@@ -276,7 +298,14 @@ fn kouluta_kaksoset(
     println!("    Serotonin:          {:.4}", tila.hormonit.serotoniini);
     println!("    Optic gland:        {:.4}", tila.hormonit.näkörauhanen);
 
-    // ── Retraining passes ─────────────────────────────────────────
+    // ── Dream phase: octopus active sleep ──────────────────────────
+    println!("\n  [Kaksoset] Dream phase (quiet sleep + active replay)...");
+    let mut uni_siemen = tahtiahjo_core::hdc_primitives::Siemen::new(314);
+    kaksoset.uni_vaihe(&näytteet, &mut uni_siemen);
+    let tarkkuus_uni = arvioi_kaksoset(&kaksoset, &näytteet, hdc);
+    println!("    Post-dream accuracy: {:.2}%", tarkkuus_uni * 100.0);
+
+    // ── Retraining passes (no dream between — preserves corrections) ─
     for kierros in 1..=uudelleen {
         println!("\n  [Kaksoset] Retraining pass {}...", kierros);
         let tarkkuus = kaksoset.uudelleenkouluta(&näytteet, hdc, kierros);
@@ -284,6 +313,12 @@ fn kouluta_kaksoset(
         println!("    Retrain accuracy:   {:.2}%", tarkkuus * 100.0);
         println!("    Evaluated accuracy: {:.2}%", tarkkuus_eval * 100.0);
     }
+
+    // ── Final dream: consolidate after all retraining ─────────────
+    println!("\n  [Kaksoset] Final dream phase (consolidation)...");
+    kaksoset.uni_vaihe(&näytteet, &mut uni_siemen);
+    let tarkkuus_final_dream = arvioi_kaksoset(&kaksoset, &näytteet, hdc);
+    println!("    Post-dream accuracy: {:.2}%", tarkkuus_final_dream * 100.0);
 
     // ── Final diagnostics ─────────────────────────────────────────
     let loppu_tila = kaksoset.tila();
@@ -293,6 +328,100 @@ fn kouluta_kaksoset(
         loppu_tila.beta, loppu_tila.hrv_koherenssi, loppu_tila.syke_jakso);
 
     loppu_tarkkuus
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// TRIPLE RELAY PIPELINE — Kolmoset
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Evaluate Kolmoset ensemble accuracy on pre-built samples.
+fn arvioi_kolmoset(
+    kolmoset: &Kolmoset,
+    näytteet: &[(Vec<f64>, char)],
+    hdc: &HdcPeruskäsitteet,
+) -> f64 {
+    if näytteet.is_empty() {
+        return 0.0;
+    }
+    let oikein = näytteet.iter()
+        .filter(|(konteksti, kohde)| {
+            let (ennuste, _) = kolmoset.ennusta(konteksti, hdc);
+            ennuste == *kohde
+        })
+        .count();
+    oikein as f64 / näytteet.len() as f64
+}
+
+fn kouluta_kolmoset(
+    teksti: &str,
+    koodikirja: &HashMap<char, Hypervektori>,
+    sitoja: &KontekstiSitoja,
+    hdc: &mut HdcPeruskäsitteet,
+    uudelleen: usize,
+) -> f64 {
+    // Build all (context, target) samples
+    println!("\n  [Kolmoset] Building context vectors...");
+    let näytteet = rakenna_näytteet(teksti, koodikirja, sitoja, hdc);
+    println!("    Samples: {}", näytteet.len());
+
+    // Extract alphabet
+    let mut aakkosto: Vec<char> = näytteet.iter().map(|(_, c)| *c).collect();
+    aakkosto.sort();
+    aakkosto.dedup();
+    println!("    Alphabet: {} characters", aakkosto.len());
+
+    // Create triple relay
+    // Scale relay legs proportionally to data size
+    let n = näytteet.len();
+    let askeleet_a = n / 5;         // ~20% broad learning
+    let askeleet_b = n / 10;        // ~10% compressed distillation
+    let askeleet_c = n / 5;         // ~20% deep integration
+    println!("    Relay legs: A={}, B={}, C={}", askeleet_a, askeleet_b, askeleet_c);
+    let mut kolmoset = Kolmoset::new_custom(
+        &aakkosto, ULOTTUVUUS, askeleet_a, askeleet_b, askeleet_c,
+    );
+
+    // ── Single-pass training with relay ──────────────────────────
+    println!("\n  [Kolmoset] Training (relay cascade)...");
+    let mut kaadot = 0usize;
+    for (konteksti, kohde) in &näytteet {
+        let tulos = kolmoset.kouluta_askel(konteksti, *kohde, hdc);
+        if tulos.kaato.is_some() {
+            kaadot += 1;
+        }
+    }
+
+    let tila = kolmoset.tila();
+    let tarkkuus_alku = arvioi_kolmoset(&kolmoset, &näytteet, hdc);
+    println!("    Online accuracy:     {:.2}% (during training)", tila.tarkkuus * 100.0);
+    println!("    Ensemble accuracy:   {:.2}% (post-training)", tarkkuus_alku * 100.0);
+    println!("    Memory dumps:        {} relay transitions", kaadot);
+    println!("    Active node:         {}", tila.aktiivinen);
+    println!("    ─── Node Details ───");
+    println!("    A (Source):  acc={:.1}%  trust={:.3}  cycles={}  steps={}",
+        tila.a_tarkkuus * 100.0, tila.a_luottamus, tila.a_kierrokset, tila.a_askeleet);
+    println!("    B (Bridge):  acc={:.1}%  trust={:.3}  cycles={}  steps={}",
+        tila.b_tarkkuus * 100.0, tila.b_luottamus, tila.b_kierrokset, tila.b_askeleet);
+    println!("    C (Target):  acc={:.1}%  trust={:.3}  cycles={}  steps={}",
+        tila.c_tarkkuus * 100.0, tila.c_luottamus, tila.c_kierrokset, tila.c_askeleet);
+
+    // ── Retraining passes ─────────────────────────────────────────
+    for kierros in 1..=uudelleen {
+        println!("\n  [Kolmoset] Retraining pass {}...", kierros);
+        let tarkkuus = kolmoset.uudelleenkouluta(&näytteet, hdc, kierros);
+        let tarkkuus_eval = arvioi_kolmoset(&kolmoset, &näytteet, hdc);
+        println!("    Retrain accuracy:   {:.2}%", tarkkuus * 100.0);
+        println!("    Ensemble accuracy:  {:.2}%", tarkkuus_eval * 100.0);
+    }
+
+    // ── Final ─────────────────────────────────────────────────────
+    let loppu = arvioi_kolmoset(&kolmoset, &näytteet, hdc);
+    let loppu_tila = kolmoset.tila();
+    println!("\n  [Kolmoset] Final state:");
+    println!("    A trust={:.3}  B trust={:.3}  C trust={:.3}",
+        loppu_tila.a_luottamus, loppu_tila.b_luottamus, loppu_tila.c_luottamus);
+
+    loppu
 }
 
 // ═══════════════════════════════════════════════════════════════════════
