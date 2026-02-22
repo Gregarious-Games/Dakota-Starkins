@@ -313,6 +313,17 @@ class SwarmLanguageModel:
         variance = np.mean((params - mean_params) ** 2)
         return min(0.95, float(np.exp(-variance * 2.0)))  # Kuistilta — cap prevents runaway comfort on uniform blocks
 
+    def _govern_comfort(self, node, delta):
+        """Comfort governor — high comfort resists further increase.
+        Prevents runaway feedback on uniform phonetic blocks.
+        The closer to 1.0, the harder it is to push higher."""
+        if delta > 0:
+            headroom = 1.0 - node.comfort
+            governed = delta * headroom  # exponential damping near ceiling
+        else:
+            governed = delta  # penalties pass through ungoverned
+        node.comfort = max(0.0, min(1.0, node.comfort + governed))
+
     def _run_swarm_steps(self):
         """
         K steps of all-to-all coupling in converge mode.
@@ -481,7 +492,10 @@ class SwarmLanguageModel:
             heat_bonus = 0.02 * (0.5 + coherence) if self.phonetic_mode else 0.02
             for node in self.nodes:
                 node.heat_valence = min(1.0, node.heat_valence + heat_bonus)
-                node.comfort = min(1.0, node.comfort + comfort_bonus)
+                if self.phonetic_mode:
+                    self._govern_comfort(node, comfort_bonus)
+                else:
+                    node.comfort = min(1.0, node.comfort + comfort_bonus)
         else:
             # Layer 2: Phonetic neighborhoods — partial credit for close misses
             if self.phonetic_mode:
@@ -506,7 +520,7 @@ class SwarmLanguageModel:
                 heat_delta = -0.01 * (1.0 - phon_sim) * (0.5 + coherence)
                 for node in self.nodes:
                     node.heat_valence = max(0.0, node.heat_valence + heat_delta)
-                    node.comfort = max(0.0, node.comfort + comfort_delta)
+                    self._govern_comfort(node, comfort_delta)
             else:
                 # Original binary penalty
                 # Pull target prototype toward output

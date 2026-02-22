@@ -104,18 +104,21 @@ PHONETIC_SIGNATURES = {
     "'":  [-0.5, -0.8, -1.0, +1.0, -0.5, +0.0],  # apostrophe = glottal flick
     '\n': [ 0.0,  0.0,  0.0,  0.0,  0.0,  0.0],  # newline = paragraph silence
 
-    # Digits — rhythmic count patterns (frequency ramp from -1 to +1)
-    #          [aper, dur,  voic, place, mann, freq]
-    '0': [ 0.0, -0.4,  0.0,  0.0,  0.0, -1.0],
-    '1': [ 0.0, -0.4,  0.0,  0.0,  0.0, -0.8],
-    '2': [ 0.0, -0.4,  0.0,  0.0,  0.0, -0.6],
-    '3': [ 0.0, -0.4,  0.0,  0.0,  0.0, -0.4],
-    '4': [ 0.0, -0.4,  0.0,  0.0,  0.0, -0.2],
-    '5': [ 0.0, -0.4,  0.0,  0.0,  0.0,  0.0],
-    '6': [ 0.0, -0.4,  0.0,  0.0,  0.0, +0.2],
-    '7': [ 0.0, -0.4,  0.0,  0.0,  0.0, +0.4],
-    '8': [ 0.0, -0.4,  0.0,  0.0,  0.0, +0.6],
-    '9': [ 0.0, -0.4,  0.0,  0.0,  0.0, +0.8],
+    # Digits — phonetic centroids of Finnish spoken forms
+    # Each digit is the MEAN of its constituent phonemes' signatures.
+    # "yksi" and "kolme" are completely different mouth motions,
+    # so digits get genuinely different signatures.
+    #          [aper,  dur,   voic,  place, mann,  freq ]
+    '0': [+0.12, +0.66, +1.00, +0.04, +0.90, -0.40],  # nolla
+    '1': [-0.53, +0.12, +0.00, +0.00, +0.25, +0.30],  # yksi
+    '2': [-0.36, +0.06, -0.20, +0.24, +0.00, -0.02],  # kaksi
+    '3': [-0.18, +0.34, +0.60, -0.04, +0.50, -0.40],  # kolme
+    '4': [-0.06, +0.48, +1.00, -0.06, +0.60, -0.24],  # neljä
+    '5': [-0.30, +0.64, +0.60, -0.40, +0.60, +0.52],  # viisi
+    '6': [-0.36, +0.34, +0.20, +0.24, +0.40, -0.08],  # kuusi
+    '7': [-0.29, +0.51, +0.33, -0.20, +0.44, +0.07],  # seitsemän
+    '8': [-0.26, +0.13, +0.11, +0.27, +0.06, -0.27],  # kahdeksan
+    '9': [-0.33, +0.17, +0.25, +0.15, +0.19, -0.14],  # yhdeksän
 }
 
 
