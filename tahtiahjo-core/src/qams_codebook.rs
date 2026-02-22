@@ -289,6 +289,89 @@ pub fn luo_koodikirja(
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// FULL PHONETIC SIGNATURE TABLE
+// ═══════════════════════════════════════════════════════════════════
+//
+// All characters that appear in Finnish and English text.
+// Port of PHONETIC_SIGNATURES from qams_codebook.py.
+
+/// Complete phonetic signature table for all supported characters.
+pub fn kaikki_allekirjoitukset() -> HashMap<char, ÄänneAllekirjoitus> {
+    let mut t = HashMap::new();
+
+    // Vowels — open, sustained, voiced, approximant
+    //                                 aukko  kesto  ääntö paikka  tapa  taajuus
+    t.insert('a', ÄänneAllekirjoitus::new( 1.0,  1.0,  1.0,  0.0,  1.0, -0.4));
+    t.insert('e', ÄänneAllekirjoitus::new( 0.5,  0.8,  1.0, -0.2,  1.0,  0.0));
+    t.insert('i', ÄänneAllekirjoitus::new( 0.0,  0.7,  1.0, -0.4,  1.0,  0.6));
+    t.insert('o', ÄänneAllekirjoitus::new( 0.6,  0.8,  1.0,  0.2,  1.0, -0.5));
+    t.insert('u', ÄänneAllekirjoitus::new( 0.0,  0.7,  1.0,  0.4,  1.0, -0.6));
+    // Finnish front vowels
+    t.insert('ä', ÄänneAllekirjoitus::new( 1.0,  1.0,  1.0, -0.6,  1.0,  0.1));
+    t.insert('ö', ÄänneAllekirjoitus::new( 0.6,  0.8,  1.0, -0.4,  1.0, -0.1));
+    t.insert('å', ÄänneAllekirjoitus::new( 0.9,  0.9,  1.0,  0.3,  1.0, -0.5));
+    // 'y' as Finnish front vowel (palatal approximant in English, vowel in Finnish)
+    // handled below as approximant — Finnish 'y' ≈ German ü
+
+    // Plosives — closed, impulse, stop
+    t.insert('b', ÄänneAllekirjoitus::new(-1.0, -1.0,  1.0, -1.0, -1.0, -0.7));
+    t.insert('p', ÄänneAllekirjoitus::new(-1.0, -1.0, -1.0, -1.0, -1.0, -0.6));
+    t.insert('d', ÄänneAllekirjoitus::new(-1.0, -1.0,  1.0,  0.0, -1.0, -0.4));
+    t.insert('t', ÄänneAllekirjoitus::new(-1.0, -1.0, -1.0,  0.0, -1.0,  0.2));
+    t.insert('g', ÄänneAllekirjoitus::new(-1.0, -1.0,  1.0,  0.8, -1.0, -0.6));
+    t.insert('k', ÄänneAllekirjoitus::new(-1.0, -1.0, -1.0,  0.8, -1.0, -0.5));
+
+    // Fricatives — narrow aperture, sustained, fricative manner
+    t.insert('f', ÄänneAllekirjoitus::new(-0.7,  0.5, -1.0, -0.8,  0.0,  0.3));
+    t.insert('v', ÄänneAllekirjoitus::new(-0.7,  0.5,  1.0, -0.8,  0.0,  0.1));
+    t.insert('s', ÄänneAllekirjoitus::new(-0.8,  0.6, -1.0,  0.0,  0.0,  0.7));
+    t.insert('z', ÄänneAllekirjoitus::new(-0.8,  0.6,  1.0,  0.0,  0.0,  0.5));
+    t.insert('h', ÄänneAllekirjoitus::new( 0.0,  0.3, -1.0,  1.0,  0.0, -0.4));
+
+    // Nasals — closed, voiced, nasal manner
+    t.insert('m', ÄänneAllekirjoitus::new(-1.0,  0.6,  1.0, -1.0,  0.5, -0.7));
+    t.insert('n', ÄänneAllekirjoitus::new(-1.0,  0.5,  1.0,  0.0,  0.5, -0.5));
+
+    // Approximants / Liquids
+    t.insert('l', ÄänneAllekirjoitus::new( 0.0,  0.5,  1.0,  0.0,  1.0, -0.3));
+    t.insert('r', ÄänneAllekirjoitus::new(-0.3,  0.4,  1.0,  0.1,  1.0, -0.4));
+    t.insert('w', ÄänneAllekirjoitus::new(-0.4,  0.2,  1.0, -1.0,  1.0, -0.7));
+    t.insert('y', ÄänneAllekirjoitus::new(-0.3,  0.2,  1.0, -0.4,  1.0,  0.4));
+
+    // Affricates / Special consonants
+    t.insert('c', ÄänneAllekirjoitus::new(-0.9, -0.5, -1.0,  0.0, -0.5,  0.1));
+    t.insert('j', ÄänneAllekirjoitus::new(-0.8, -0.4,  1.0, -0.1, -0.5,  0.0));
+    t.insert('q', ÄänneAllekirjoitus::new(-1.0, -1.0, -1.0,  0.8, -1.0, -0.5));
+    t.insert('x', ÄänneAllekirjoitus::new(-0.9, -0.3, -1.0,  0.0, -0.5,  0.4));
+
+    // Punctuation — silence primitives (SPS for text)
+    t.insert(' ',  ÄänneAllekirjoitus::new( 0.0,  0.0,  0.0,  0.0,  0.0,  0.0));
+    t.insert('.',  ÄänneAllekirjoitus::new( 0.0,  0.0,  0.0,  0.0,  0.0, -0.1));
+    t.insert(',',  ÄänneAllekirjoitus::new( 0.0,  0.0,  0.0,  0.0,  0.0,  0.1));
+    t.insert('!',  ÄänneAllekirjoitus::new( 0.0,  0.0,  0.0,  0.0,  0.0,  0.9));
+    t.insert('?',  ÄänneAllekirjoitus::new( 0.0,  0.0,  0.0,  0.0,  0.0,  0.6));
+    t.insert(':',  ÄänneAllekirjoitus::new( 0.0,  0.0,  0.0,  0.0,  0.0,  0.2));
+    t.insert(';',  ÄänneAllekirjoitus::new( 0.0,  0.0,  0.0,  0.0,  0.0,  0.15));
+    t.insert('-',  ÄänneAllekirjoitus::new( 0.0,  0.0,  0.0,  0.0,  0.0, -0.2));
+    t.insert('\'', ÄänneAllekirjoitus::new(-0.5, -0.8, -1.0,  1.0, -0.5,  0.0));
+    t.insert('\n', ÄänneAllekirjoitus::new( 0.0,  0.0,  0.0,  0.0,  0.0,  0.0));
+
+    // Digits — Finnish spoken-form centroids
+    t.insert('0', ÄänneAllekirjoitus::new( 0.12,  0.66,  1.00,  0.04,  0.90, -0.40));
+    t.insert('1', ÄänneAllekirjoitus::new(-0.53,  0.12,  0.00,  0.00,  0.25,  0.30));
+    t.insert('2', ÄänneAllekirjoitus::new(-0.36,  0.06, -0.20,  0.24,  0.00, -0.02));
+    t.insert('3', ÄänneAllekirjoitus::new(-0.18,  0.34,  0.60, -0.04,  0.50, -0.40));
+    t.insert('4', ÄänneAllekirjoitus::new(-0.06,  0.48,  1.00, -0.06,  0.60, -0.24));
+    t.insert('5', ÄänneAllekirjoitus::new(-0.30,  0.64,  0.60, -0.40,  0.60,  0.52));
+    t.insert('6', ÄänneAllekirjoitus::new(-0.36,  0.34,  0.20,  0.24,  0.40, -0.08));
+    t.insert('7', ÄänneAllekirjoitus::new(-0.29,  0.51,  0.33, -0.20,  0.44,  0.07));
+    t.insert('8', ÄänneAllekirjoitus::new(-0.26,  0.13,  0.11,  0.27,  0.06, -0.27));
+    t.insert('9', ÄänneAllekirjoitus::new(-0.33,  0.17,  0.25,  0.15,  0.19, -0.14));
+
+    t
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // TESTS
 // ═══════════════════════════════════════════════════════════════════
 

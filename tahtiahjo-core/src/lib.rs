@@ -9,4 +9,5 @@
 pub mod hdc_primitives;
 pub mod dennis_node;
 pub mod konteksti_sitoja;
+pub mod luokka_kertyma;
 pub mod qams_codebook;
