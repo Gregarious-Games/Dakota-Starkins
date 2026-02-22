@@ -1,0 +1,34 @@
+STEP 5: Multiplicative QAMS — Results Summary
+===============================================
+Date: February 22, 2026
+Coherence cap: 0.95 (commit 42a1a33)
+
+ENGLISH 10K
+  Random:        10.1%  |  Additive: 11.4% (+1.3%)  |  Multiplicative: 14.3% (+4.2%)  |  Ratio: 3.34x
+
+ENGLISH 20K
+  Random:        10.2%  |  Additive: 11.0% (+0.8%)  |  Multiplicative: 13.6% (+3.4%)  |  Ratio: 4.12x
+
+FINNISH 10K
+  Random:        12.4%  |  Additive: 14.8% (+2.3%)  |  Multiplicative: 17.2% (+4.8%)  |  Ratio: 2.05x
+
+FINNISH 20K
+  Random:        13.3%  |  Additive: 15.0% (+1.7%)  |  Multiplicative: 18.6% (+5.3%)  |  Ratio: 3.12x
+
+FINNISH 90K (overnight, with coherence cap)
+  Random:        13.9%  |  Additive: 15.3% (+1.5%)  |  Multiplicative: 18.8% (+4.9%)  |  Ratio: 3.36x
+  Peak windows:  32.2%  |             33.6%          |                  33.2%
+
+HYPOTHESIS: multiplicative gap > 2x additive gap
+  CONFIRMED on all 5 runs. Ratios: 3.34x, 4.12x, 2.05x, 3.12x, 3.36x
+
+KEY FINDINGS:
+  - Multiplicative accuracy plateaus ~18.8% at 90K — more data alone won't break 20%
+  - Coherence cap (0.95) softened digit collapse but didn't eliminate it
+  - Digit/consonant repetition still appears in generated samples at long sequences
+  - Multiplicative model runs FASTER than additive (56.7 vs 53.3 steps/s) — phonetic
+    injection skips Weyl permutation
+  - Finnish multiplicative learns Kalevala verse structure: indentation, comma-newline,
+    vowel harmony patterns
+
+NEXT: spoken-form digit encoding, comfort governor, Rust rewrite
