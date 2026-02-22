@@ -1723,9 +1723,21 @@ def compute_swarm_phi(nodes):
         median_z = np.median([nd.z_scalar for nd in nodes])
         current_state = tuple(1 if nd.z_scalar >= median_z else 0 for nd in nodes)
         substrate = pyphi.Subsystem(network, current_state)
-        sia = pyphi.compute.sia(substrate)
-        phi_value = sia.phi
-        return phi_value
+
+        # Run SIA with a timeout to avoid hanging on degenerate TPMs
+        import concurrent.futures
+        def _compute_sia():
+            return pyphi.compute.sia(substrate)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_compute_sia)
+            try:
+                sia = future.result(timeout=120)  # 2 minute max per SIA
+                phi_value = sia.phi
+                return phi_value
+            except concurrent.futures.TimeoutError:
+                print(f"[timeout >120s]", end=" ")
+                return None
     except Exception as e:
         print(f"    [PyPhi] Error computing Phi: {e}")
         return None
@@ -2784,6 +2796,183 @@ def run_eye_of_horus_comparison(steps=10000):
     return all_results
 
 
+def run_pyphi_audit(n_nodes=4, steps=3000, checkpoints=None):
+    """Compute REAL IIT Phi (via PyPhi) at multiple stages of swarm evolution.
+
+    This is the ground truth test. PyPhi computes the System Irreducibility
+    Analysis (SIA) — the minimum information partition — which gives the
+    actual integrated information Phi as defined by Tononi et al.
+
+    We measure Phi at several stages to see how integration develops:
+      1. Random init (no coupling yet)
+      2. Early coupling (500 steps)
+      3. Mid coupling (1500 steps)
+      4. Converged (3000 steps)
+      5. After perturbation (kill + regrow)
+
+    Also compares converge vs complementary modes.
+
+    NOTE: PyPhi SIA is exponential in N. We use N=4 nodes which gives
+    2^4 = 16 states — tractable. N=5 would be 32 states, still doable
+    but slower. N>6 is impractical.
+    """
+    if checkpoints is None:
+        # Dense early checkpoints to catch the transition, then final state
+        checkpoints = [0, 10, 50, 200, 500, 1000, steps]
+
+    set_dimension(64)
+    print("\n" + "="*70)
+    print("  REAL IIT PHI AUDIT (PyPhi — ground truth)")
+    print(f"  N={n_nodes}, D={HDC_DIM}, steps={steps}")
+    print(f"  Measuring Phi at steps: {checkpoints}")
+    print("="*70)
+    print()
+    print("  PyPhi computes the System Irreducibility Analysis (SIA):")
+    print("  Phi > 0 means the system has integrated information that")
+    print("  would be LOST under any bipartition. This is the real deal.")
+    print()
+
+    results = {}
+
+    for mode in ["converge", "complementary"]:
+        print(f"\n  {'-'*60}")
+        print(f"  MODE: {mode.upper()}")
+        print(f"  {'-'*60}")
+
+        nodes = [DennisNode(f"N{i}", DEFAULT_PARAMS.copy()) for i in range(n_nodes)]
+        for nd in nodes:
+            nd.void_outer = np.ones(HDC_DIM)
+            nd.heat_valence = 1.0
+
+        threshold, max_abs = 0.0001, CLAMP_HIGH
+        names = [f"N{i}" for i in range(n_nodes)]
+        phi_trajectory = []
+
+        # Measure at step 0 (random init)
+        if 0 in checkpoints:
+            print(f"\n    Step 0 (random init):")
+            pair_sims = [_hdc.similarity(nodes[i].Z, nodes[j].Z)
+                        for i in range(n_nodes) for j in range(i+1, n_nodes)]
+            mean_sim = np.mean(pair_sims)
+            print(f"      Mean sim: {mean_sim:.4f}")
+            phi = compute_swarm_phi(nodes)
+            print(f"      PyPhi Phi = {phi}")
+            phi_trajectory.append((0, phi, mean_sim))
+
+        # Run dynamics with checkpoints
+        for step in range(1, steps + 1):
+            z_sc = {names[i]: nodes[i].z_scalar for i in range(n_nodes)}
+            for i in range(n_nodes):
+                nr = [nodes[j].relational for j in range(n_nodes) if j != i]
+                nn = [names[j] for j in range(n_nodes) if j != i]
+                nodes[i].update(nr, nn, z_sc, threshold, max_abs,
+                    iter_count=step, coupling_mode=mode,
+                    renormalize_z=True, target_z_scalar=0.75,
+                    coupling_target="X1")
+
+            if step in checkpoints:
+                pair_sims = [_hdc.similarity(nodes[i].Z, nodes[j].Z)
+                            for i in range(n_nodes) for j in range(i+1, n_nodes)]
+                mean_sim = np.mean(pair_sims)
+
+                print(f"\n    Step {step}:")
+                print(f"      Mean sim: {mean_sim:.4f}")
+                for nd in nodes:
+                    print(f"        {nd.name}: z_scalar={nd.z_scalar:.4f}, "
+                          f"health={nd.health:.4f}, energy={nd.energy:.2f}")
+
+                # Coupling matrix
+                print(f"      Coupling matrix (cosine sim):")
+                for i in range(n_nodes):
+                    row = []
+                    for j in range(n_nodes):
+                        if i == j:
+                            row.append(" 1.00")
+                        else:
+                            row.append(f"{_hdc.similarity(nodes[i].Z, nodes[j].Z):5.2f}")
+                    print(f"        {names[i]}: {'  '.join(row)}")
+
+                print(f"      Computing PyPhi SIA...", end=" ", flush=True)
+                phi = compute_swarm_phi(nodes)
+                print(f"Phi = {phi}")
+                phi_trajectory.append((step, phi, mean_sim))
+
+        # Perturbation test: kill a node and measure Phi recovery
+        print(f"\n    PERTURBATION TEST:")
+        print(f"      Killing N0 (replacing Z with random vector)...")
+        original_z = nodes[0].Z.copy()
+        nodes[0].Z = random_unit_vector()
+        nodes[0].X1 = random_unit_vector()
+        nodes[0]._update_z_scalar()
+
+        pair_sims = [_hdc.similarity(nodes[i].Z, nodes[j].Z)
+                    for i in range(n_nodes) for j in range(i+1, n_nodes)]
+        mean_sim = np.mean(pair_sims)
+        print(f"      Post-kill sim: {mean_sim:.4f}")
+        phi = compute_swarm_phi(nodes)
+        print(f"      Post-kill Phi = {phi}")
+        phi_trajectory.append(("kill", phi, mean_sim))
+
+        # Let it recover for 1000 steps
+        print(f"      Running 1000 recovery steps...")
+        for step in range(steps + 1, steps + 1001):
+            z_sc = {names[i]: nodes[i].z_scalar for i in range(n_nodes)}
+            for i in range(n_nodes):
+                nr = [nodes[j].relational for j in range(n_nodes) if j != i]
+                nn = [names[j] for j in range(n_nodes) if j != i]
+                nodes[i].update(nr, nn, z_sc, threshold, max_abs,
+                    iter_count=step, coupling_mode=mode,
+                    renormalize_z=True, target_z_scalar=0.75,
+                    coupling_target="X1")
+
+        pair_sims = [_hdc.similarity(nodes[i].Z, nodes[j].Z)
+                    for i in range(n_nodes) for j in range(i+1, n_nodes)]
+        mean_sim = np.mean(pair_sims)
+        recovery_fid = _hdc.similarity(nodes[0].Z, original_z)
+        print(f"      Post-recovery sim: {mean_sim:.4f}")
+        print(f"      N0 recovery fidelity: {recovery_fid:.4f}")
+        phi = compute_swarm_phi(nodes)
+        print(f"      Post-recovery Phi = {phi}")
+        phi_trajectory.append(("recover", phi, mean_sim))
+
+        # Summary for this mode
+        print(f"\n    {mode.upper()} PHI TRAJECTORY:")
+        print(f"    {'Stage':>12s}  {'Phi':>10s}  {'Sim':>8s}")
+        print(f"    {'-'*12}  {'-'*10}  {'-'*8}")
+        for entry in phi_trajectory:
+            stage = str(entry[0])
+            phi_val = f"{entry[1]:.6f}" if entry[1] is not None else "ERROR"
+            sim_val = f"{entry[2]:.4f}"
+            print(f"    {stage:>12s}  {phi_val:>10s}  {sim_val:>8s}")
+
+        results[mode] = phi_trajectory
+
+    # Cross-mode comparison
+    print(f"\n  {'='*60}")
+    print(f"  CROSS-MODE COMPARISON (real IIT Phi)")
+    print(f"  {'='*60}")
+    for mode, traj in results.items():
+        final = [t for t in traj if isinstance(t[0], int)]
+        if final:
+            last = final[-1]
+            print(f"    {mode:>15s}: Phi={last[1]:.6f} at sim={last[2]:.4f} (step {last[0]})")
+
+    conv_traj = results.get("converge", [])
+    comp_traj = results.get("complementary", [])
+    if conv_traj and comp_traj:
+        conv_final = [t for t in conv_traj if isinstance(t[0], int)][-1][1]
+        comp_final = [t for t in comp_traj if isinstance(t[0], int)][-1][1]
+        if conv_final is not None and comp_final is not None:
+            print(f"\n    Converge Phi / Complementary Phi = {conv_final / max(comp_final, 1e-12):.2f}x")
+            if conv_final > comp_final:
+                print(f"    --> Converged swarm has MORE integrated information")
+            else:
+                print(f"    --> Complementary swarm has MORE integrated information")
+
+    print()
+    return results
+
+
 if __name__ == "__main__":
     print("SCALING FORGE HDC v1.0 -- Hypervector-Brained DennisNode")
     print(f"D={HDC_DIM}, PHI={PHI:.6f}, GAMMA={GAMMA:.6f}")
@@ -2794,8 +2983,8 @@ if __name__ == "__main__":
 
     t0 = time.time()
 
-    # Run Eye of Horus comparison: D=64 vs D=256
-    run_eye_of_horus_comparison(steps=10000)
+    # Run real PyPhi audit
+    run_pyphi_audit(n_nodes=4, steps=3000)
 
     elapsed = time.time() - t0
     print(f"{'='*70}")
