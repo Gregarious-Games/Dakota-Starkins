@@ -86,8 +86,10 @@ const OLETUS_ALPHA_SIIRTYMÄ: f64 = 0.015;
 /// Default weight for frequency prior in score adjustment
 const OLETUS_ALPHA_TAAJUUS: f64 = 0.005;
 
-/// Default weight for recurrent state in context enrichment
-const OLETUS_ALPHA_KIERTO: f64 = 0.05;
+/// Default weight for recurrent state in context enrichment.
+/// Ablation finding: recurrence is anti-coherent (-8.30% when isolated).
+/// Default to 0.0 — the recurrent channel corrupts context vectors.
+const OLETUS_ALPHA_KIERTO: f64 = 0.0;
 
 /// Default weight for word-boundary prior adjustment
 const OLETUS_ALPHA_SANA: f64 = 0.008;
@@ -992,6 +994,21 @@ impl Keskus {
     /// Get the alphabet
     pub fn aakkosto(&self) -> &[char] {
         &self.aakkosto
+    }
+
+    /// Get the previous character (for external pole selection).
+    pub fn edellinen(&self) -> Option<char> {
+        self.edellinen_merkki
+    }
+
+    /// Get transition probability P(next | prev_char) for a given character.
+    pub fn siirtymä_p(&self, seuraava: char) -> f64 {
+        if let Some(ed) = self.edellinen_merkki {
+            self.siirtymät.todennäköisyys(ed, seuraava, self.aakkosto.len())
+        } else {
+            // No previous char — return uniform
+            1.0 / self.aakkosto.len() as f64
+        }
     }
 }
 

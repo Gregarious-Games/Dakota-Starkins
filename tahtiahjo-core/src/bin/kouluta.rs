@@ -11,6 +11,10 @@
 //!   --kaksoset        Use twin accumulator with heart/membrane physics
 //!   --kolmoset        Use triple relay cascade (A→B→C→A)
 //!   --keskus          Wrap Kolmoset with Keskus (transition priors + recurrence)
+//!   --alpha-siirtyma=F  Override transition prior weight (default: 0.015)
+//!   --alpha-taajuus=F   Override frequency prior weight (default: 0.005)
+//!   --alpha-kierto=F    Override recurrent blend weight (default: 0.05)
+//!   --alpha-sana=F      Override word-boundary weight (default: 0.008)
 //!   --compare         Run all architectures side-by-side
 //!
 //! Examples:
@@ -31,6 +35,7 @@ use tahtiahjo_core::qams_codebook::{kaikki_allekirjoitukset, luo_koodikirja};
 use tahtiahjo_core::kaksoset::Kaksoset;
 use tahtiahjo_core::kolmoset::Kolmoset;
 use tahtiahjo_core::keskus::Keskus;
+use tahtiahjo_core::kaksoisnapainen::KaksoisnapainenKartta;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -49,6 +54,19 @@ fn main() {
     let mut käytä_keskus = false;
     let mut vertaa = false;
 
+    // Alpha overrides for Keskus (None = use defaults)
+    let mut alpha_siirtyma: Option<f64> = None;
+    let mut alpha_taajuus: Option<f64> = None;
+    let mut alpha_kierto: Option<f64> = None;
+    let mut alpha_sana: Option<f64> = None;
+
+    // Bipyramid options
+    let mut käytä_bipyramid = false;
+    let mut bipyramid_threshold: f64 = 0.01;
+
+    // Dimension override (default uses ULOTTUVUUS=256)
+    let mut ulottuvuus: usize = ULOTTUVUUS;
+
     for arg in &args[2..] {
         if let Some(val) = arg.strip_prefix("--chars=") {
             max_merkit = val.parse().unwrap_or(10_000);
@@ -66,6 +84,21 @@ fn main() {
             käytä_keskus = true;
         } else if arg == "--compare" {
             vertaa = true;
+        } else if let Some(val) = arg.strip_prefix("--alpha-siirtyma=") {
+            alpha_siirtyma = val.parse().ok();
+        } else if let Some(val) = arg.strip_prefix("--alpha-taajuus=") {
+            alpha_taajuus = val.parse().ok();
+        } else if let Some(val) = arg.strip_prefix("--alpha-kierto=") {
+            alpha_kierto = val.parse().ok();
+        } else if let Some(val) = arg.strip_prefix("--alpha-sana=") {
+            alpha_sana = val.parse().ok();
+        } else if arg == "--bipyramid" {
+            käytä_bipyramid = true;
+        } else if let Some(val) = arg.strip_prefix("--bipyramid-threshold=") {
+            bipyramid_threshold = val.parse().unwrap_or(0.01);
+            käytä_bipyramid = true;
+        } else if let Some(val) = arg.strip_prefix("--dim=") {
+            ulottuvuus = val.parse().unwrap_or(ULOTTUVUUS);
         }
     }
 
@@ -85,9 +118,11 @@ fn main() {
     println!("  Window:     {}", ikkuna);
     println!("  Codebook:   {}", koodikirja_tyyppi);
     println!("  Retrain:    {} passes", uudelleen);
-    println!("  Dimension:  D={}", ULOTTUVUUS);
+    println!("  Dimension:  D={}", ulottuvuus);
     if vertaa {
         println!("  Mode:       COMPARE (all architectures)");
+    } else if käytä_kolmoset && käytä_keskus && käytä_bipyramid {
+        println!("  Mode:       KOLMOSET + KESKUS + BIPYRAMID (2-stage pole prediction)");
     } else if käytä_kolmoset && käytä_keskus {
         println!("  Mode:       KOLMOSET + KESKUS (relay + priors + recurrence)");
     } else if käytä_kolmoset {
@@ -103,22 +138,22 @@ fn main() {
     let koodikirja: HashMap<char, Hypervektori> = if koodikirja_tyyppi == "qams" {
         println!("  Building QAMS phonetic codebook...");
         let allekirjoitukset = kaikki_allekirjoitukset();
-        let mut kirja = luo_koodikirja(&allekirjoitukset, ULOTTUVUUS, 42);
+        let mut kirja = luo_koodikirja(&allekirjoitukset, ulottuvuus, 42);
         // Add any characters from text that aren't in QAMS signatures
         let mut rng = tahtiahjo_core::hdc_primitives::Siemen::new(777);
         for c in teksti.chars() {
             let c_lower = c.to_lowercase().next().unwrap_or(c);
             kirja.entry(c_lower)
-                .or_insert_with(|| rng.bipolaarinen_vektori(ULOTTUVUUS));
+                .or_insert_with(|| rng.bipolaarinen_vektori(ulottuvuus));
         }
         kirja
     } else {
         println!("  Building random codebook...");
-        luo_satunnainen_koodikirja(&teksti, ULOTTUVUUS, 99)
+        luo_satunnainen_koodikirja(&teksti, ulottuvuus, 99)
     };
     println!("  Codebook size: {} characters", koodikirja.len());
 
-    let mut hdc = HdcPeruskäsitteet::new(ULOTTUVUUS, 42);
+    let mut hdc = HdcPeruskäsitteet::new(ulottuvuus, 42);
     let sitoja = KontekstiSitoja::new(ikkuna);
 
     if vertaa {
@@ -126,13 +161,13 @@ fn main() {
         // COMPARE MODE: run all architectures side-by-side
         // ═══════════════════════════════════════════════════════════════
         let tarkkuus_lk = kouluta_luokkakertymä(
-            &teksti, &koodikirja, &sitoja, &mut hdc, uudelleen,
+            &teksti, &koodikirja, &sitoja, &mut hdc, uudelleen, ulottuvuus,
         );
         let tarkkuus_kk = kouluta_kaksoset(
-            &teksti, &koodikirja, &sitoja, &mut hdc, uudelleen,
+            &teksti, &koodikirja, &sitoja, &mut hdc, uudelleen, ulottuvuus,
         );
         let tarkkuus_km = kouluta_kolmoset(
-            &teksti, &koodikirja, &sitoja, &mut hdc, uudelleen,
+            &teksti, &koodikirja, &sitoja, &mut hdc, uudelleen, ulottuvuus,
         );
 
         println!("\n═══════════════════════════════════════════════════════════════");
@@ -152,12 +187,23 @@ fn main() {
             println!("  >>> LuokkaKertymä wins");
         }
         println!("═══════════════════════════════════════════════════════════════");
+    } else if käytä_kolmoset && käytä_keskus && käytä_bipyramid {
+        // ═══════════════════════════════════════════════════════════════
+        // KOLMOSET + KESKUS + BIPYRAMID MODE
+        // ═══════════════════════════════════════════════════════════════
+        let alpha_overrides = (alpha_siirtyma, alpha_taajuus, alpha_kierto, alpha_sana);
+        let tarkkuus = kouluta_kolmoset_keskus_kaksoisnapainen(
+            &teksti, &koodikirja, &sitoja, &mut hdc, uudelleen,
+            alpha_overrides, bipyramid_threshold, ulottuvuus,
+        );
+        tulosta_lopputulos(tarkkuus);
     } else if käytä_kolmoset && käytä_keskus {
         // ═══════════════════════════════════════════════════════════════
         // KOLMOSET + KESKUS MODE
         // ═══════════════════════════════════════════════════════════════
+        let alpha_overrides = (alpha_siirtyma, alpha_taajuus, alpha_kierto, alpha_sana);
         let tarkkuus = kouluta_kolmoset_keskus(
-            &teksti, &koodikirja, &sitoja, &mut hdc, uudelleen,
+            &teksti, &koodikirja, &sitoja, &mut hdc, uudelleen, alpha_overrides, ulottuvuus,
         );
         tulosta_lopputulos(tarkkuus);
     } else if käytä_kolmoset {
@@ -165,7 +211,7 @@ fn main() {
         // KOLMOSET MODE
         // ═══════════════════════════════════════════════════════════════
         let tarkkuus = kouluta_kolmoset(
-            &teksti, &koodikirja, &sitoja, &mut hdc, uudelleen,
+            &teksti, &koodikirja, &sitoja, &mut hdc, uudelleen, ulottuvuus,
         );
         tulosta_lopputulos(tarkkuus);
     } else if käytä_kaksoset {
@@ -173,7 +219,7 @@ fn main() {
         // KAKSOSET MODE
         // ═══════════════════════════════════════════════════════════════
         let tarkkuus = kouluta_kaksoset(
-            &teksti, &koodikirja, &sitoja, &mut hdc, uudelleen,
+            &teksti, &koodikirja, &sitoja, &mut hdc, uudelleen, ulottuvuus,
         );
         tulosta_lopputulos(tarkkuus);
     } else {
@@ -181,7 +227,7 @@ fn main() {
         // STANDARD MODE (LuokkaKertymä)
         // ═══════════════════════════════════════════════════════════════
         let tarkkuus = kouluta_luokkakertymä(
-            &teksti, &koodikirja, &sitoja, &mut hdc, uudelleen,
+            &teksti, &koodikirja, &sitoja, &mut hdc, uudelleen, ulottuvuus,
         );
         tulosta_lopputulos(tarkkuus);
     }
@@ -197,8 +243,9 @@ fn kouluta_luokkakertymä(
     sitoja: &KontekstiSitoja,
     hdc: &mut HdcPeruskäsitteet,
     uudelleen: usize,
+    ulottuvuus: usize,
 ) -> f64 {
-    let mut kertymä = LuokkaKertymä::new(ULOTTUVUUS);
+    let mut kertymä = LuokkaKertymä::new(ulottuvuus);
 
     println!("\n  [LuokkaKertymä] Training (single pass)...");
     let näytteet = kertymä.kouluta(teksti, koodikirja, sitoja, hdc);
@@ -276,6 +323,7 @@ fn kouluta_kaksoset(
     sitoja: &KontekstiSitoja,
     hdc: &mut HdcPeruskäsitteet,
     uudelleen: usize,
+    ulottuvuus: usize,
 ) -> f64 {
     // Build all (context, target) samples
     println!("\n  [Kaksoset] Building context vectors...");
@@ -289,7 +337,7 @@ fn kouluta_kaksoset(
     println!("    Alphabet: {} characters", aakkosto.len());
 
     // Create twin swarm
-    let mut kaksoset = Kaksoset::new(&aakkosto, ULOTTUVUUS);
+    let mut kaksoset = Kaksoset::new(&aakkosto, ulottuvuus);
 
     // ── Single-pass training ──────────────────────────────────────
     println!("\n  [Kaksoset] Training (single pass, heart active)...");
@@ -374,6 +422,7 @@ fn kouluta_kolmoset(
     sitoja: &KontekstiSitoja,
     hdc: &mut HdcPeruskäsitteet,
     uudelleen: usize,
+    ulottuvuus: usize,
 ) -> f64 {
     // Build all (context, target) samples
     println!("\n  [Kolmoset] Building context vectors...");
@@ -394,7 +443,7 @@ fn kouluta_kolmoset(
     let askeleet_c = n / 5;         // ~20% deep integration
     println!("    Relay legs: A={}, B={}, C={}", askeleet_a, askeleet_b, askeleet_c);
     let mut kolmoset = Kolmoset::new_custom(
-        &aakkosto, ULOTTUVUUS, askeleet_a, askeleet_b, askeleet_c,
+        &aakkosto, ulottuvuus, askeleet_a, askeleet_b, askeleet_c,
     );
 
     // ── Single-pass training with relay ──────────────────────────
@@ -485,12 +534,25 @@ fn arvioi_kolmoset_keskus(
     oikein as f64 / näytteet.len() as f64
 }
 
+/// Apply alpha overrides to a Keskus instance.
+fn sovella_alpha_yliajot(
+    keskus: &mut Keskus,
+    overrides: (Option<f64>, Option<f64>, Option<f64>, Option<f64>),
+) {
+    if let Some(v) = overrides.0 { keskus.alpha_siirtymä = v; }
+    if let Some(v) = overrides.1 { keskus.alpha_taajuus = v; }
+    if let Some(v) = overrides.2 { keskus.alpha_kierto = v; }
+    if let Some(v) = overrides.3 { keskus.alpha_sana = v; }
+}
+
 fn kouluta_kolmoset_keskus(
     teksti: &str,
     koodikirja: &HashMap<char, Hypervektori>,
     sitoja: &KontekstiSitoja,
     hdc: &mut HdcPeruskäsitteet,
     uudelleen: usize,
+    alpha_overrides: (Option<f64>, Option<f64>, Option<f64>, Option<f64>),
+    ulottuvuus: usize,
 ) -> f64 {
     // Build all (context, target) samples
     println!("\n  [Kolmoset+Keskus] Building context vectors...");
@@ -510,15 +572,20 @@ fn kouluta_kolmoset_keskus(
     let askeleet_c = n / 5;
     println!("    Relay legs: A={}, B={}, C={}", askeleet_a, askeleet_b, askeleet_c);
     let mut kolmoset = Kolmoset::new_custom(
-        &aakkosto, ULOTTUVUUS, askeleet_a, askeleet_b, askeleet_c,
+        &aakkosto, ulottuvuus, askeleet_a, askeleet_b, askeleet_c,
     );
 
     // ── Create Keskus ───────────────────────────────────────────────
-    let mut keskus = Keskus::new(&aakkosto, koodikirja.clone(), ULOTTUVUUS);
+    let mut keskus = Keskus::new(&aakkosto, koodikirja.clone(), ulottuvuus);
+    sovella_alpha_yliajot(&mut keskus, alpha_overrides);
+
+    // Display active alphas
+    println!("\n  [Keskus] Alphas: siirtymä={:.4} taajuus={:.4} kierto={:.4} sana={:.4}",
+        keskus.alpha_siirtymä, keskus.alpha_taajuus, keskus.alpha_kierto, keskus.alpha_sana);
 
     // ── CRITICAL: Pre-train Keskus on raw corpus ────────────────────
     // Perfect bigram statistics from step 1.
-    println!("\n  [Keskus] Pre-training on corpus (transitions + frequencies)...");
+    println!("  [Keskus] Pre-training on corpus (transitions + frequencies)...");
     let teksti_lower: String = teksti.chars()
         .map(|c| c.to_lowercase().next().unwrap_or(c))
         .collect();
@@ -554,7 +621,8 @@ fn kouluta_kolmoset_keskus(
     println!("\n  [Kolmoset] Raw ensemble accuracy:   {:.2}%", tarkkuus_raaka * 100.0);
 
     // Fresh Keskus for evaluation (reset recurrent state)
-    let mut keskus_eval = Keskus::new(&aakkosto, koodikirja.clone(), ULOTTUVUUS);
+    let mut keskus_eval = Keskus::new(&aakkosto, koodikirja.clone(), ulottuvuus);
+    sovella_alpha_yliajot(&mut keskus_eval, alpha_overrides);
     keskus_eval.esikouluta(&teksti_lower);
     let tarkkuus_keskus = arvioi_kolmoset_keskus(
         &kolmoset, &mut keskus_eval, &näytteet, hdc,
@@ -572,7 +640,8 @@ fn kouluta_kolmoset_keskus(
         println!("    Raw ensemble:       {:.2}%", tarkkuus_raaka * 100.0);
 
         // Re-evaluate with fresh Keskus (recurrent state from scratch each pass)
-        let mut keskus_pass = Keskus::new(&aakkosto, koodikirja.clone(), ULOTTUVUUS);
+        let mut keskus_pass = Keskus::new(&aakkosto, koodikirja.clone(), ulottuvuus);
+        sovella_alpha_yliajot(&mut keskus_pass, alpha_overrides);
         keskus_pass.esikouluta(&teksti_lower);
         let tarkkuus_k = arvioi_kolmoset_keskus(
             &kolmoset, &mut keskus_pass, &näytteet, hdc,
@@ -587,7 +656,8 @@ fn kouluta_kolmoset_keskus(
 
     // ── Final ─────────────────────────────────────────────────────
     let loppu_raaka = arvioi_kolmoset(&kolmoset, &näytteet, hdc);
-    let mut keskus_final = Keskus::new(&aakkosto, koodikirja.clone(), ULOTTUVUUS);
+    let mut keskus_final = Keskus::new(&aakkosto, koodikirja.clone(), ulottuvuus);
+    sovella_alpha_yliajot(&mut keskus_final, alpha_overrides);
     keskus_final.esikouluta(&teksti_lower);
     let loppu_keskus = arvioi_kolmoset_keskus(
         &kolmoset, &mut keskus_final, &näytteet, hdc,
@@ -603,6 +673,266 @@ fn kouluta_kolmoset_keskus(
         keskus_tila.stressitaso, keskus_tila.ikkuna_tarkkuus * 100.0, keskus_tila.kierto_normi);
 
     loppu_keskus
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// KOLMOSET + KESKUS + BIPYRAMID PIPELINE
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Evaluate with bipyramid 2-stage prediction:
+///   1. Get all scores (same as flat: rikasta → kaikki_pisteet → sovella_priorit)
+///   2. Average scores by pole → pick winning pole
+///   3. If margin < threshold → fallback to flat argmax
+///   4. Otherwise: argmax within winning pole only
+///
+/// Returns (accuracy, pole_correct_count, fallback_count).
+fn arvioi_kolmoset_keskus_kaksoisnapainen(
+    kolmoset: &Kolmoset,
+    keskus: &mut Keskus,
+    näytteet: &[(Vec<f64>, char)],
+    hdc: &HdcPeruskäsitteet,
+    kartta: &KaksoisnapainenKartta,
+    kynnys: f64,
+) -> (f64, usize, usize) {
+    if näytteet.is_empty() {
+        return (0.0, 0, 0);
+    }
+    let mut oikein = 0usize;
+    let mut napa_oikein = 0usize;
+    let mut varatiet = 0usize;
+
+    for (konteksti, kohde) in näytteet {
+        // 1. Enrich context with recurrent state
+        let rikastettu = keskus.rikasta(konteksti);
+
+        // 2. Get raw scores from Kolmoset on enriched context
+        let raa_at = kolmoset.kaikki_pisteet(&rikastettu, hdc);
+
+        // 3. Apply transition + frequency + word boundary priors
+        let säädetyt = keskus.sovella_priorit(&raa_at);
+
+        // 4. Bipyramid pole selection — use transition probabilities
+        let kohde_napa = kartta.napa(*kohde);
+        let (voittaja_napa, _napa_pisteet, marginaali) = kartta.valitse_napa_siirtymä(
+            |c| keskus.siirtymä_p(c),
+        );
+
+        if voittaja_napa == kohde_napa {
+            napa_oikein += 1;
+        }
+
+        // 5. Decide: bipyramid or flat fallback
+        let ennuste = if marginaali < kynnys {
+            // Low confidence → flat argmax (fallback)
+            varatiet += 1;
+            säädetyt.iter()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(&c, _)| c)
+                .unwrap_or(' ')
+        } else {
+            // High confidence → argmax within winning pole only
+            säädetyt.iter()
+                .filter(|(&c, _)| kartta.napa(c) == voittaja_napa)
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(&c, _)| c)
+                .unwrap_or_else(|| {
+                    // Pole empty? Fall back to flat
+                    säädetyt.iter()
+                        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                        .map(|(&c, _)| c)
+                        .unwrap_or(' ')
+                })
+        };
+
+        if ennuste == *kohde {
+            oikein += 1;
+        }
+
+        // 6. Update Keskus state
+        let luottamus = säädetyt.get(&ennuste).copied().unwrap_or(0.0).abs().min(1.0);
+        keskus.päivitä(ennuste, *kohde, konteksti, luottamus, hdc);
+    }
+
+    let tarkkuus = oikein as f64 / näytteet.len() as f64;
+    (tarkkuus, napa_oikein, varatiet)
+}
+
+fn kouluta_kolmoset_keskus_kaksoisnapainen(
+    teksti: &str,
+    koodikirja: &HashMap<char, Hypervektori>,
+    sitoja: &KontekstiSitoja,
+    hdc: &mut HdcPeruskäsitteet,
+    uudelleen: usize,
+    alpha_overrides: (Option<f64>, Option<f64>, Option<f64>, Option<f64>),
+    bipyramid_kynnys: f64,
+    ulottuvuus: usize,
+) -> f64 {
+    // Build all (context, target) samples
+    println!("\n  [Kolmoset+Keskus+Bipyramid] Building context vectors...");
+    let näytteet = rakenna_näytteet(teksti, koodikirja, sitoja, hdc);
+    println!("    Samples: {}", näytteet.len());
+
+    // Extract alphabet
+    let mut aakkosto: Vec<char> = näytteet.iter().map(|(_, c)| *c).collect();
+    aakkosto.sort();
+    aakkosto.dedup();
+    println!("    Alphabet: {} characters", aakkosto.len());
+
+    // Build bipyramid map
+    let kartta = KaksoisnapainenKartta::new(&aakkosto);
+    kartta.tulosta_yhteenveto();
+    println!("    Bipyramid threshold: {:.4}", bipyramid_kynnys);
+
+    // Create triple relay (same as vanilla Kolmoset)
+    let n = näytteet.len();
+    let askeleet_a = n / 5;
+    let askeleet_b = n / 10;
+    let askeleet_c = n / 5;
+    println!("    Relay legs: A={}, B={}, C={}", askeleet_a, askeleet_b, askeleet_c);
+    let mut kolmoset = Kolmoset::new_custom(
+        &aakkosto, ulottuvuus, askeleet_a, askeleet_b, askeleet_c,
+    );
+
+    // ── Create Keskus ───────────────────────────────────────────────
+    let mut keskus = Keskus::new(&aakkosto, koodikirja.clone(), ulottuvuus);
+    sovella_alpha_yliajot(&mut keskus, alpha_overrides);
+
+    println!("\n  [Keskus] Alphas: siirtymä={:.4} taajuus={:.4} kierto={:.4} sana={:.4}",
+        keskus.alpha_siirtymä, keskus.alpha_taajuus, keskus.alpha_kierto, keskus.alpha_sana);
+
+    // ── Pre-train Keskus on raw corpus ────────────────────────────
+    println!("  [Keskus] Pre-training on corpus (transitions + frequencies)...");
+    let teksti_lower: String = teksti.chars()
+        .map(|c| c.to_lowercase().next().unwrap_or(c))
+        .collect();
+    keskus.esikouluta(&teksti_lower);
+    let keskus_tila = keskus.tila();
+    println!("    Transitions: {} observed", keskus_tila.siirtymä_näytteet);
+    println!("    Frequencies: {} observed", keskus_tila.taajuus_näytteet);
+    println!("    Avg word length: {:.1}", keskus_tila.keskimääräinen_sanan_pituus);
+
+    // ── Single-pass Kolmoset training (no Keskus — raw training) ─
+    println!("\n  [Kolmoset] Training (relay cascade)...");
+    let mut kaadot = 0usize;
+    for (konteksti, kohde) in &näytteet {
+        let tulos = kolmoset.kouluta_askel(konteksti, *kohde, hdc);
+        if tulos.kaato.is_some() {
+            kaadot += 1;
+        }
+    }
+
+    let tila = kolmoset.tila();
+    println!("    Online accuracy:     {:.2}% (during training)", tila.tarkkuus * 100.0);
+    println!("    Memory dumps:        {} relay transitions", kaadot);
+    println!("    ─── Node Details ───");
+    println!("    A (Source):  acc={:.1}%  trust={:.3}  cycles={}  steps={}",
+        tila.a_tarkkuus * 100.0, tila.a_luottamus, tila.a_kierrokset, tila.a_askeleet);
+    println!("    B (Bridge):  acc={:.1}%  trust={:.3}  cycles={}  steps={}",
+        tila.b_tarkkuus * 100.0, tila.b_luottamus, tila.b_kierrokset, tila.b_askeleet);
+    println!("    C (Target):  acc={:.1}%  trust={:.3}  cycles={}  steps={}",
+        tila.c_tarkkuus * 100.0, tila.c_luottamus, tila.c_kierrokset, tila.c_askeleet);
+
+    // ── Evaluate: flat vs bipyramid ─────────────────────────────────
+    let tarkkuus_raaka = arvioi_kolmoset(&kolmoset, &näytteet, hdc);
+    println!("\n  [Kolmoset] Raw ensemble accuracy:   {:.2}%", tarkkuus_raaka * 100.0);
+
+    // Flat Keskus evaluation (for comparison)
+    let mut keskus_flat = Keskus::new(&aakkosto, koodikirja.clone(), ulottuvuus);
+    sovella_alpha_yliajot(&mut keskus_flat, alpha_overrides);
+    keskus_flat.esikouluta(&teksti_lower);
+    let tarkkuus_flat = arvioi_kolmoset_keskus(
+        &kolmoset, &mut keskus_flat, &näytteet, hdc,
+    );
+    println!("  [Flat Keskus] Enriched accuracy:     {:.2}%  (Δ = {:+.2}%)",
+        tarkkuus_flat * 100.0, (tarkkuus_flat - tarkkuus_raaka) * 100.0);
+
+    // Bipyramid evaluation
+    let mut keskus_bipy = Keskus::new(&aakkosto, koodikirja.clone(), ulottuvuus);
+    sovella_alpha_yliajot(&mut keskus_bipy, alpha_overrides);
+    keskus_bipy.esikouluta(&teksti_lower);
+    let (tarkkuus_bp, napa_oikein, varatiet) = arvioi_kolmoset_keskus_kaksoisnapainen(
+        &kolmoset, &mut keskus_bipy, &näytteet, hdc, &kartta, bipyramid_kynnys,
+    );
+    let napa_tarkkuus = napa_oikein as f64 / näytteet.len() as f64;
+    let varatie_osuus = varatiet as f64 / näytteet.len() as f64;
+    println!("  [Bipyramid] Enriched accuracy:       {:.2}%  (Δ vs flat = {:+.2}%)",
+        tarkkuus_bp * 100.0, (tarkkuus_bp - tarkkuus_flat) * 100.0);
+    println!("  [Bipyramid] Pole accuracy:           {:.2}%", napa_tarkkuus * 100.0);
+    println!("  [Bipyramid] Fallback rate:           {:.2}%", varatie_osuus * 100.0);
+
+    // ── Retraining passes ────────────────────────────────────────────
+    let mut paras_bp = tarkkuus_bp;
+    let mut paras_flat = tarkkuus_flat;
+    for kierros in 1..=uudelleen {
+        println!("\n  [Kolmoset] Retraining pass {}...", kierros);
+        let tarkkuus_retrain = kolmoset.uudelleenkouluta(&näytteet, hdc, kierros);
+        let tarkkuus_raaka = arvioi_kolmoset(&kolmoset, &näytteet, hdc);
+        println!("    Retrain accuracy:   {:.2}%", tarkkuus_retrain * 100.0);
+        println!("    Raw ensemble:       {:.2}%", tarkkuus_raaka * 100.0);
+
+        // Flat re-evaluation
+        let mut keskus_pass_flat = Keskus::new(&aakkosto, koodikirja.clone(), ulottuvuus);
+        sovella_alpha_yliajot(&mut keskus_pass_flat, alpha_overrides);
+        keskus_pass_flat.esikouluta(&teksti_lower);
+        let tarkkuus_f = arvioi_kolmoset_keskus(
+            &kolmoset, &mut keskus_pass_flat, &näytteet, hdc,
+        );
+
+        // Bipyramid re-evaluation
+        let mut keskus_pass_bp = Keskus::new(&aakkosto, koodikirja.clone(), ulottuvuus);
+        sovella_alpha_yliajot(&mut keskus_pass_bp, alpha_overrides);
+        keskus_pass_bp.esikouluta(&teksti_lower);
+        let (tarkkuus_b, napa_ok, varatiet_p) = arvioi_kolmoset_keskus_kaksoisnapainen(
+            &kolmoset, &mut keskus_pass_bp, &näytteet, hdc, &kartta, bipyramid_kynnys,
+        );
+
+        let napa_t = napa_ok as f64 / näytteet.len() as f64;
+        let var_t = varatiet_p as f64 / näytteet.len() as f64;
+        println!("    Flat Keskus:        {:.2}%  (Δ = {:+.2}%)",
+            tarkkuus_f * 100.0, (tarkkuus_f - tarkkuus_raaka) * 100.0);
+        println!("    Bipyramid:          {:.2}%  (Δ vs flat = {:+.2}%)  pole={:.1}%  fallback={:.1}%",
+            tarkkuus_b * 100.0, (tarkkuus_b - tarkkuus_f) * 100.0,
+            napa_t * 100.0, var_t * 100.0);
+
+        if tarkkuus_b > paras_bp { paras_bp = tarkkuus_b; }
+        if tarkkuus_f > paras_flat { paras_flat = tarkkuus_f; }
+    }
+
+    // ── Final ─────────────────────────────────────────────────────
+    let loppu_raaka = arvioi_kolmoset(&kolmoset, &näytteet, hdc);
+
+    let mut keskus_final_flat = Keskus::new(&aakkosto, koodikirja.clone(), ulottuvuus);
+    sovella_alpha_yliajot(&mut keskus_final_flat, alpha_overrides);
+    keskus_final_flat.esikouluta(&teksti_lower);
+    let loppu_flat = arvioi_kolmoset_keskus(
+        &kolmoset, &mut keskus_final_flat, &näytteet, hdc,
+    );
+
+    let mut keskus_final_bp = Keskus::new(&aakkosto, koodikirja.clone(), ulottuvuus);
+    sovella_alpha_yliajot(&mut keskus_final_bp, alpha_overrides);
+    keskus_final_bp.esikouluta(&teksti_lower);
+    let (loppu_bp, loppu_napa_ok, loppu_varatiet) = arvioi_kolmoset_keskus_kaksoisnapainen(
+        &kolmoset, &mut keskus_final_bp, &näytteet, hdc, &kartta, bipyramid_kynnys,
+    );
+
+    let loppu_napa_t = loppu_napa_ok as f64 / näytteet.len() as f64;
+    let loppu_var_t = loppu_varatiet as f64 / näytteet.len() as f64;
+
+    println!("\n  [Final] Kolmoset raw:     {:.2}%", loppu_raaka * 100.0);
+    println!("  [Final] Flat Keskus:      {:.2}%  (Δ = {:+.2}%)",
+        loppu_flat * 100.0, (loppu_flat - loppu_raaka) * 100.0);
+    println!("  [Final] Bipyramid:        {:.2}%  (Δ vs flat = {:+.2}%)",
+        loppu_bp * 100.0, (loppu_bp - loppu_flat) * 100.0);
+    println!("  [Final] Peak flat:        {:.2}%", paras_flat * 100.0);
+    println!("  [Final] Peak bipyramid:   {:.2}%", paras_bp * 100.0);
+    println!("  [Final] Pole accuracy:    {:.2}%", loppu_napa_t * 100.0);
+    println!("  [Final] Fallback rate:    {:.2}%", loppu_var_t * 100.0);
+
+    let keskus_tila = keskus_final_bp.tila();
+    println!("  [Keskus] Stress: {:.3}  Window acc: {:.2}%  Recurrent ‖‖: {:.4}",
+        keskus_tila.stressitaso, keskus_tila.ikkuna_tarkkuus * 100.0, keskus_tila.kierto_normi);
+
+    loppu_bp
 }
 
 // ═══════════════════════════════════════════════════════════════════════
