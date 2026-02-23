@@ -10,12 +10,14 @@
 //!   --codebook=TYPE   random | qams (default: qams)
 //!   --kaksoset        Use twin accumulator with heart/membrane physics
 //!   --kolmoset        Use triple relay cascade (A→B→C→A)
+//!   --keskus          Wrap Kolmoset with Keskus (transition priors + recurrence)
 //!   --compare         Run all architectures side-by-side
 //!
 //! Examples:
 //!   cargo run --release --bin kouluta -- ../kalevala.txt --chars=10000 --codebook=qams
 //!   cargo run --release --bin kouluta -- ../kalevala.txt --kaksoset
 //!   cargo run --release --bin kouluta -- ../kalevala.txt --kolmoset
+//!   cargo run --release --bin kouluta -- ../kalevala.txt --kolmoset --keskus
 //!   cargo run --release --bin kouluta -- ../kalevala.txt --compare
 
 use std::collections::HashMap;
@@ -28,6 +30,7 @@ use tahtiahjo_core::luokka_kertyma::{LuokkaKertymä, luo_satunnainen_koodikirja}
 use tahtiahjo_core::qams_codebook::{kaikki_allekirjoitukset, luo_koodikirja};
 use tahtiahjo_core::kaksoset::Kaksoset;
 use tahtiahjo_core::kolmoset::Kolmoset;
+use tahtiahjo_core::keskus::Keskus;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -43,6 +46,7 @@ fn main() {
     let mut koodikirja_tyyppi = "qams".to_string();
     let mut käytä_kaksoset = false;
     let mut käytä_kolmoset = false;
+    let mut käytä_keskus = false;
     let mut vertaa = false;
 
     for arg in &args[2..] {
@@ -58,6 +62,8 @@ fn main() {
             käytä_kaksoset = true;
         } else if arg == "--kolmoset" {
             käytä_kolmoset = true;
+        } else if arg == "--keskus" {
+            käytä_keskus = true;
         } else if arg == "--compare" {
             vertaa = true;
         }
@@ -82,6 +88,8 @@ fn main() {
     println!("  Dimension:  D={}", ULOTTUVUUS);
     if vertaa {
         println!("  Mode:       COMPARE (all architectures)");
+    } else if käytä_kolmoset && käytä_keskus {
+        println!("  Mode:       KOLMOSET + KESKUS (relay + priors + recurrence)");
     } else if käytä_kolmoset {
         println!("  Mode:       KOLMOSET (triple relay cascade)");
     } else if käytä_kaksoset {
@@ -144,6 +152,14 @@ fn main() {
             println!("  >>> LuokkaKertymä wins");
         }
         println!("═══════════════════════════════════════════════════════════════");
+    } else if käytä_kolmoset && käytä_keskus {
+        // ═══════════════════════════════════════════════════════════════
+        // KOLMOSET + KESKUS MODE
+        // ═══════════════════════════════════════════════════════════════
+        let tarkkuus = kouluta_kolmoset_keskus(
+            &teksti, &koodikirja, &sitoja, &mut hdc, uudelleen,
+        );
+        tulosta_lopputulos(tarkkuus);
     } else if käytä_kolmoset {
         // ═══════════════════════════════════════════════════════════════
         // KOLMOSET MODE
@@ -422,6 +438,171 @@ fn kouluta_kolmoset(
         loppu_tila.a_luottamus, loppu_tila.b_luottamus, loppu_tila.c_luottamus);
 
     loppu
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// KOLMOSET + KESKUS PIPELINE
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Evaluate Kolmoset+Keskus: enrich context, get raw scores, apply priors.
+/// Sequential because Keskus has state (transitions, recurrent carry-forward).
+fn arvioi_kolmoset_keskus(
+    kolmoset: &Kolmoset,
+    keskus: &mut Keskus,
+    näytteet: &[(Vec<f64>, char)],
+    hdc: &HdcPeruskäsitteet,
+) -> f64 {
+    if näytteet.is_empty() {
+        return 0.0;
+    }
+    let mut oikein = 0usize;
+
+    for (konteksti, kohde) in näytteet {
+        // 1. Enrich context with recurrent state
+        let rikastettu = keskus.rikasta(konteksti);
+
+        // 2. Get raw scores from Kolmoset on enriched context
+        let raa_at = kolmoset.kaikki_pisteet(&rikastettu, hdc);
+
+        // 3. Apply transition + frequency + word boundary priors
+        let säädetyt = keskus.sovella_priorit(&raa_at);
+
+        // 4. Argmax on adjusted scores
+        let (ennuste, paras_piste) = säädetyt.iter()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(&c, &s)| (c, s))
+            .unwrap_or((' ', 0.0));
+
+        if ennuste == *kohde {
+            oikein += 1;
+        }
+
+        // 5. Update Keskus state (recurrent, transitions, health)
+        let luottamus = paras_piste.abs().min(1.0);
+        keskus.päivitä(ennuste, *kohde, konteksti, luottamus, hdc);
+    }
+
+    oikein as f64 / näytteet.len() as f64
+}
+
+fn kouluta_kolmoset_keskus(
+    teksti: &str,
+    koodikirja: &HashMap<char, Hypervektori>,
+    sitoja: &KontekstiSitoja,
+    hdc: &mut HdcPeruskäsitteet,
+    uudelleen: usize,
+) -> f64 {
+    // Build all (context, target) samples
+    println!("\n  [Kolmoset+Keskus] Building context vectors...");
+    let näytteet = rakenna_näytteet(teksti, koodikirja, sitoja, hdc);
+    println!("    Samples: {}", näytteet.len());
+
+    // Extract alphabet
+    let mut aakkosto: Vec<char> = näytteet.iter().map(|(_, c)| *c).collect();
+    aakkosto.sort();
+    aakkosto.dedup();
+    println!("    Alphabet: {} characters", aakkosto.len());
+
+    // Create triple relay (same as vanilla Kolmoset)
+    let n = näytteet.len();
+    let askeleet_a = n / 5;
+    let askeleet_b = n / 10;
+    let askeleet_c = n / 5;
+    println!("    Relay legs: A={}, B={}, C={}", askeleet_a, askeleet_b, askeleet_c);
+    let mut kolmoset = Kolmoset::new_custom(
+        &aakkosto, ULOTTUVUUS, askeleet_a, askeleet_b, askeleet_c,
+    );
+
+    // ── Create Keskus ───────────────────────────────────────────────
+    let mut keskus = Keskus::new(&aakkosto, koodikirja.clone(), ULOTTUVUUS);
+
+    // ── CRITICAL: Pre-train Keskus on raw corpus ────────────────────
+    // Perfect bigram statistics from step 1.
+    println!("\n  [Keskus] Pre-training on corpus (transitions + frequencies)...");
+    let teksti_lower: String = teksti.chars()
+        .map(|c| c.to_lowercase().next().unwrap_or(c))
+        .collect();
+    keskus.esikouluta(&teksti_lower);
+    let keskus_tila = keskus.tila();
+    println!("    Transitions: {} observed", keskus_tila.siirtymä_näytteet);
+    println!("    Frequencies: {} observed", keskus_tila.taajuus_näytteet);
+    println!("    Avg word length: {:.1}", keskus_tila.keskimääräinen_sanan_pituus);
+
+    // ── Single-pass Kolmoset training (no Keskus here — raw training) ─
+    println!("\n  [Kolmoset] Training (relay cascade)...");
+    let mut kaadot = 0usize;
+    for (konteksti, kohde) in &näytteet {
+        let tulos = kolmoset.kouluta_askel(konteksti, *kohde, hdc);
+        if tulos.kaato.is_some() {
+            kaadot += 1;
+        }
+    }
+
+    let tila = kolmoset.tila();
+    println!("    Online accuracy:     {:.2}% (during training)", tila.tarkkuus * 100.0);
+    println!("    Memory dumps:        {} relay transitions", kaadot);
+    println!("    ─── Node Details ───");
+    println!("    A (Source):  acc={:.1}%  trust={:.3}  cycles={}  steps={}",
+        tila.a_tarkkuus * 100.0, tila.a_luottamus, tila.a_kierrokset, tila.a_askeleet);
+    println!("    B (Bridge):  acc={:.1}%  trust={:.3}  cycles={}  steps={}",
+        tila.b_tarkkuus * 100.0, tila.b_luottamus, tila.b_kierrokset, tila.b_askeleet);
+    println!("    C (Target):  acc={:.1}%  trust={:.3}  cycles={}  steps={}",
+        tila.c_tarkkuus * 100.0, tila.c_luottamus, tila.c_kierrokset, tila.c_askeleet);
+
+    // ── Evaluate: Kolmoset raw vs Kolmoset+Keskus ───────────────────
+    let tarkkuus_raaka = arvioi_kolmoset(&kolmoset, &näytteet, hdc);
+    println!("\n  [Kolmoset] Raw ensemble accuracy:   {:.2}%", tarkkuus_raaka * 100.0);
+
+    // Fresh Keskus for evaluation (reset recurrent state)
+    let mut keskus_eval = Keskus::new(&aakkosto, koodikirja.clone(), ULOTTUVUUS);
+    keskus_eval.esikouluta(&teksti_lower);
+    let tarkkuus_keskus = arvioi_kolmoset_keskus(
+        &kolmoset, &mut keskus_eval, &näytteet, hdc,
+    );
+    println!("  [Kolmoset+Keskus] Enriched accuracy: {:.2}%  (Δ = {:+.2}%)",
+        tarkkuus_keskus * 100.0, (tarkkuus_keskus - tarkkuus_raaka) * 100.0);
+
+    // ── Retraining passes (Kolmoset retrains, Keskus re-evaluates) ──
+    let mut paras_keskus = tarkkuus_keskus;
+    for kierros in 1..=uudelleen {
+        println!("\n  [Kolmoset] Retraining pass {}...", kierros);
+        let tarkkuus_retrain = kolmoset.uudelleenkouluta(&näytteet, hdc, kierros);
+        let tarkkuus_raaka = arvioi_kolmoset(&kolmoset, &näytteet, hdc);
+        println!("    Retrain accuracy:   {:.2}%", tarkkuus_retrain * 100.0);
+        println!("    Raw ensemble:       {:.2}%", tarkkuus_raaka * 100.0);
+
+        // Re-evaluate with fresh Keskus (recurrent state from scratch each pass)
+        let mut keskus_pass = Keskus::new(&aakkosto, koodikirja.clone(), ULOTTUVUUS);
+        keskus_pass.esikouluta(&teksti_lower);
+        let tarkkuus_k = arvioi_kolmoset_keskus(
+            &kolmoset, &mut keskus_pass, &näytteet, hdc,
+        );
+        println!("    Keskus-enriched:    {:.2}%  (Δ = {:+.2}%)",
+            tarkkuus_k * 100.0, (tarkkuus_k - tarkkuus_raaka) * 100.0);
+
+        if tarkkuus_k > paras_keskus {
+            paras_keskus = tarkkuus_k;
+        }
+    }
+
+    // ── Final ─────────────────────────────────────────────────────
+    let loppu_raaka = arvioi_kolmoset(&kolmoset, &näytteet, hdc);
+    let mut keskus_final = Keskus::new(&aakkosto, koodikirja.clone(), ULOTTUVUUS);
+    keskus_final.esikouluta(&teksti_lower);
+    let loppu_keskus = arvioi_kolmoset_keskus(
+        &kolmoset, &mut keskus_final, &näytteet, hdc,
+    );
+
+    println!("\n  [Final] Kolmoset raw:     {:.2}%", loppu_raaka * 100.0);
+    println!("  [Final] Kolmoset+Keskus:  {:.2}%  (Δ = {:+.2}%)",
+        loppu_keskus * 100.0, (loppu_keskus - loppu_raaka) * 100.0);
+    println!("  [Final] Peak Keskus:      {:.2}%", paras_keskus * 100.0);
+
+    let keskus_tila = keskus_final.tila();
+    println!("  [Keskus] Stress: {:.3}  Window acc: {:.2}%  Recurrent ‖‖: {:.4}",
+        keskus_tila.stressitaso, keskus_tila.ikkuna_tarkkuus * 100.0, keskus_tila.kierto_normi);
+
+    loppu_keskus
 }
 
 // ═══════════════════════════════════════════════════════════════════════

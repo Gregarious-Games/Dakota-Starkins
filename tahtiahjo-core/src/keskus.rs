@@ -78,17 +78,19 @@ use crate::hdc_primitives::{
 /// The golden ratio split: new information enters at the minor ratio.
 const KIERTO_RAPAUTUMINEN: f64 = TAU; // 0.618
 
-/// Default weight for transition prior in score adjustment
-const OLETUS_ALPHA_SIIRTYMÄ: f64 = 0.8;
+/// Default weight for transition prior in score adjustment.
+/// Cosine similarities ~[-0.3, 0.3], log-probs ~[-10, -1].
+/// Scale down so prior is a gentle nudge, not a sledgehammer.
+const OLETUS_ALPHA_SIIRTYMÄ: f64 = 0.015;
 
 /// Default weight for frequency prior in score adjustment
-const OLETUS_ALPHA_TAAJUUS: f64 = 0.3;
+const OLETUS_ALPHA_TAAJUUS: f64 = 0.005;
 
 /// Default weight for recurrent state in context enrichment
-const OLETUS_ALPHA_KIERTO: f64 = 0.25;
+const OLETUS_ALPHA_KIERTO: f64 = 0.05;
 
 /// Default weight for word-boundary prior adjustment
-const OLETUS_ALPHA_SANA: f64 = 0.4;
+const OLETUS_ALPHA_SANA: f64 = 0.008;
 
 /// Health window: track last N predictions for stress calculation
 const TERVEYS_IKKUNA: usize = 100;
@@ -698,10 +700,16 @@ impl Keskus {
             return konteksti.to_vec();
         }
 
+        // Normalize recurrent state to match context magnitude before blending.
+        // HDC hygiene: everything is direction, not magnitude.
+        let ctx_norm = konteksti.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let kierto_norm = self.kierto_tila.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let scale = if kierto_norm > 1e-12 { ctx_norm / kierto_norm } else { 0.0 };
+
         let a = self.alpha_kierto;
         konteksti.iter()
             .zip(self.kierto_tila.iter())
-            .map(|(&k, &r)| (1.0 - a) * k + a * r)
+            .map(|(&k, &r)| (1.0 - a) * k + a * r * scale)
             .collect()
     }
 
@@ -725,29 +733,38 @@ impl Keskus {
         let aakkosto_koko = self.aakkosto.len();
         let mut säädetyt: HashMap<char, f64> = HashMap::new();
 
+        // Competence-based annealing: as the model gets better,
+        // the prior backs off. φ exponent gives golden-ratio decay —
+        // backs off faster than linear but never fully zeroes out.
+        let competence = self.terveys.ikkuna_tarkkuus();
+        let anneal = (1.0 - competence).powf(PHI * PHI); // φ² ≈ 2.618 — steep decay
+        let anneal = if anneal < 0.05 { 0.0 } else { anneal }; // hard cutoff
+
+        let eff_siirtymä = self.alpha_siirtymä * anneal;
+        let eff_taajuus = self.alpha_taajuus * anneal;
+        let eff_sana = self.alpha_sana * anneal;
+
         for &c in &self.aakkosto {
             let raaka = raa_at_pisteet.get(&c).copied().unwrap_or(0.0);
 
-            // Transition prior
+            // Transition prior (annealed)
             let siirtymä_bonus = if let Some(ed) = self.edellinen_merkki {
-                self.alpha_siirtymä
+                eff_siirtymä
                     * self.siirtymät.log_todennäköisyys(ed, c, aakkosto_koko)
             } else {
                 0.0
             };
 
-            // Frequency prior
-            let taajuus_bonus = self.alpha_taajuus
+            // Frequency prior (annealed)
+            let taajuus_bonus = eff_taajuus
                 * self.taajuus.log_todennäköisyys(c, aakkosto_koko);
 
-            // Word boundary adjustment
+            // Word boundary adjustment (annealed)
             let sana_bonus = if self.sana_raja.raja_tilassa() {
-                // At word boundary: boost word-initial characters
-                self.alpha_sana
+                eff_sana
                     * self.sana_raja.alku_todennäköisyys(c, aakkosto_koko).ln().max(-5.0)
             } else if SanaRaja::on_raja(c) {
-                // Space/punctuation: boost if word is getting long
-                self.alpha_sana * (self.sana_raja.välilyönti_kerroin() - 1.0)
+                eff_sana * (self.sana_raja.välilyönti_kerroin() - 1.0)
             } else {
                 0.0
             };
@@ -767,17 +784,23 @@ impl Keskus {
         let aakkosto_koko = self.aakkosto.len();
         let mut säädetyt = Vec::with_capacity(aakkosto_koko);
 
+        let competence = self.terveys.ikkuna_tarkkuus();
+        let anneal = (1.0 - competence).powf(PHI * PHI);
+        let anneal = if anneal < 0.05 { 0.0 } else { anneal };
+        let eff_siirtymä = self.alpha_siirtymä * anneal;
+        let eff_taajuus = self.alpha_taajuus * anneal;
+
         for (i, &c) in self.aakkosto.iter().enumerate() {
             let raaka = pisteet.get(i).copied().unwrap_or(0.0);
 
             let siirtymä_bonus = if let Some(ed) = self.edellinen_merkki {
-                self.alpha_siirtymä
+                eff_siirtymä
                     * self.siirtymät.log_todennäköisyys(ed, c, aakkosto_koko)
             } else {
                 0.0
             };
 
-            let taajuus_bonus = self.alpha_taajuus
+            let taajuus_bonus = eff_taajuus
                 * self.taajuus.log_todennäköisyys(c, aakkosto_koko);
 
             säädetyt.push(raaka + siirtymä_bonus + taajuus_bonus);

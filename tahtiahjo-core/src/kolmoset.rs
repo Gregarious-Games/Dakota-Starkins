@@ -427,6 +427,36 @@ impl Kolmoset {
         (paras_merkki, paras_piste)
     }
 
+    /// Get all ensemble scores as a HashMap for external prior application.
+    pub fn kaikki_pisteet(
+        &self,
+        konteksti: &[f64],
+        hdc: &HdcPeruskäsitteet,
+    ) -> std::collections::HashMap<char, f64> {
+        let paino_a = self.a.luottamus();
+        let paino_b = self.b.luottamus();
+        let paino_c = self.c.luottamus();
+        let summa = paino_a + paino_b + paino_c;
+
+        let mut pisteet = std::collections::HashMap::new();
+        for &c in &self.aakkosto {
+            let piste = if summa < 1e-12 {
+                match self.aktiivinen {
+                    0 => self.a.pisteet(konteksti, c, hdc),
+                    1 => self.b.pisteet(konteksti, c, hdc),
+                    _ => self.c.pisteet(konteksti, c, hdc),
+                }
+            } else {
+                let sa = self.a.pisteet(konteksti, c, hdc);
+                let sb = self.b.pisteet(konteksti, c, hdc);
+                let sc = self.c.pisteet(konteksti, c, hdc);
+                (paino_a * sa + paino_b * sb + paino_c * sc) / summa
+            };
+            pisteet.insert(c, piste);
+        }
+        pisteet
+    }
+
     /// Relay retrain: cascade corrections through the relay.
     ///
     /// Instead of all three nodes retraining independently,
