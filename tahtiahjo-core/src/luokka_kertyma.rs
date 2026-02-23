@@ -19,7 +19,6 @@ use std::collections::HashMap;
 
 use crate::hdc_primitives::{
     HdcPeruskäsitteet, Hypervektori, Siemen,
-    ULOTTUVUUS,
 };
 use crate::konteksti_sitoja::KontekstiSitoja;
 
@@ -347,6 +346,7 @@ pub fn luo_satunnainen_koodikirja(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hdc_primitives::ULOTTUVUUS;
 
     // Kalevala opening — enough for a smoke test
     const KALEVALA: &str = "\

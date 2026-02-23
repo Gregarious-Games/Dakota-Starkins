@@ -43,7 +43,7 @@ use std::collections::HashMap;
 
 use crate::hdc_primitives::{
     HdcPeruskäsitteet, Hypervektori,
-    ULOTTUVUUS, PHI, TAU, GAMMA,
+    PHI, TAU, GAMMA,
 };
 
 // ═══════════════════════════════════════════════════════════════════
@@ -62,8 +62,6 @@ const SYSTOLE_OSUUS: f64 = TAU; // 0.618 — golden ratio split
 const HORMONI_RAPAUTUMINEN: f64 = 0.95;
 /// Maximum Kielto suppression strength β.
 const BETA_MAX: f64 = PHI; // 1.618 — strong suppression ceiling
-/// Learning rate decay base for retraining passes.
-const OPPIMISNOPEUS_RAPAUTUMINEN: f64 = TAU; // lr × τ^pass
 
 // ═══════════════════════════════════════════════════════════════════
 // HORMONES — Hormonit
@@ -327,11 +325,6 @@ impl Sydän {
         self.koherenssi_kertymä / self.koherenssi_laskuri as f64
     }
 
-    /// Reset coherence accumulator (called on heartbeat).
-    fn nollaa_koherenssi(&mut self) {
-        self.koherenssi_kertymä = 0.0;
-        self.koherenssi_laskuri = 0;
-    }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -430,8 +423,6 @@ pub struct KaksoisKertymä {
     pub prototyypit: HashMap<char, Hypervektori>,
     /// Number of samples accumulated per class.
     laskurit: HashMap<char, usize>,
-    /// Dimension.
-    ulottuvuus: usize,
 }
 
 impl KaksoisKertymä {
@@ -442,7 +433,7 @@ impl KaksoisKertymä {
             prototyypit.insert(c, vec![0.0; ulottuvuus]);
             laskurit.insert(c, 0);
         }
-        Self { prototyypit, laskurit, ulottuvuus }
+        Self { prototyypit, laskurit }
     }
 
     /// Accumulate a context vector into a character's prototype.
@@ -547,8 +538,6 @@ pub struct Kaksoset {
     pub kalvo: Kalvo,
     /// Hormonit: neuromodulatory state.
     pub hormonit: Hormonit,
-    /// HDC engine reference dimension.
-    ulottuvuus: usize,
     /// Training step counter.
     askel: usize,
     /// Alphabet for iteration.
@@ -566,7 +555,6 @@ impl Kaksoset {
             sydän: Sydän::new(),
             kalvo: Kalvo::new(),
             hormonit: Hormonit::new(),
-            ulottuvuus,
             askel: 0,
             aakkosto: aakkosto.to_vec(),
             oikein: 0,
@@ -689,7 +677,7 @@ impl Kaksoset {
         } else {
             0.5
         };
-        let precision_lr = lr * (0.2 + 0.8 * precision);
+        let _precision_lr = lr * (0.2 + 0.8 * precision);
 
         if oikein {
             self.oikein += 1;
@@ -1006,6 +994,7 @@ pub struct KaksosetTila {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hdc_primitives::ULOTTUVUUS;
 
     fn luo_hdc() -> HdcPeruskäsitteet {
         HdcPeruskäsitteet::new(ULOTTUVUUS, 42)

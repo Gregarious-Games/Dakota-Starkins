@@ -24,8 +24,6 @@ use std::collections::HashMap;
 const PHI: f64 = 1.618_033_988_749_895;
 /// Genesis constant Γ = 1/(6φ)
 const GAMMA: f64 = 1.0 / (6.0 * PHI);
-/// Hypervector dimension
-const ULOTTUVUUS: usize = 256;
 /// Number of phonetic parameters per character
 const PARAMETRIT: usize = 6;
 
@@ -89,46 +87,6 @@ impl ÄänneAllekirjoitus {
 //   7 = "seitsemän"  [s, e, i, t, s, e, m, ä, n]
 //   8 = "kahdeksan"  [k, a, h, d, e, k, s, a, n]
 //   9 = "yhdeksän"   [y, h, d, e, k, s, ä, n]
-
-/// Compute mean signature across phonemes of a Finnish word.
-fn puhuttu_keskiarvo(
-    sana: &str,
-    taulukko: &HashMap<char, ÄänneAllekirjoitus>,
-) -> ÄänneAllekirjoitus {
-    let mut summa = [0.0f64; PARAMETRIT];
-    let mut laskuri = 0usize;
-    for merkki in sana.chars() {
-        if let Some(alle) = taulukko.get(&merkki) {
-            let arr = alle.as_array();
-            for i in 0..PARAMETRIT {
-                summa[i] += arr[i];
-            }
-            laskuri += 1;
-        }
-    }
-    if laskuri == 0 {
-        return ÄänneAllekirjoitus::new(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
-    }
-    let n = laskuri as f64;
-    ÄänneAllekirjoitus::new(
-        summa[0]/n, summa[1]/n, summa[2]/n,
-        summa[3]/n, summa[4]/n, summa[5]/n,
-    )
-}
-
-/// Finnish spoken forms for digits 0–9.
-const PUHUTUT_NUMEROT: [(&str, &str); 10] = [
-    ("0", "nolla"),
-    ("1", "yksi"),
-    ("2", "kaksi"),
-    ("3", "kolme"),
-    ("4", "neljä"),
-    ("5", "viisi"),
-    ("6", "kuusi"),
-    ("7", "seitsemän"),
-    ("8", "kahdeksan"),
-    ("9", "yhdeksän"),
-];
 
 // ═══════════════════════════════════════════════════════════════════
 // COMFORT GOVERNOR — MukavuusHallitsija
@@ -378,6 +336,7 @@ pub fn kaikki_allekirjoitukset() -> HashMap<char, ÄänneAllekirjoitus> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    const ULOTTUVUUS: usize = 256;
 
     fn test_signatures() -> HashMap<char, ÄänneAllekirjoitus> {
         let mut t = HashMap::new();

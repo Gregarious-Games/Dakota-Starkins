@@ -13,3 +13,4 @@ pub mod luokka_kertyma;
 pub mod qams_codebook;
 pub mod kaksoset;
 pub mod kolmoset;
+pub mod keskus;

@@ -41,11 +41,9 @@
 //!          & Greg Calkins
 //! Date:    February 22, 2026
 
-use std::collections::HashMap;
-
 use crate::hdc_primitives::{
-    HdcPeruskäsitteet, Hypervektori,
-    ULOTTUVUUS, PHI, TAU, GAMMA,
+    HdcPeruskäsitteet,
+    PHI, TAU, GAMMA,
 };
 use crate::kaksoset::KaksoisKertymä;
 
@@ -553,6 +551,7 @@ pub struct KolmosetTila {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hdc_primitives::ULOTTUVUUS;
 
     fn luo_hdc() -> HdcPeruskäsitteet {
         HdcPeruskäsitteet::new(ULOTTUVUUS, 42)
