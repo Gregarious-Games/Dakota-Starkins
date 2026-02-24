@@ -15,3 +15,4 @@ pub mod kaksoset;
 pub mod kolmoset;
 pub mod keskus;
 pub mod kaksoisnapainen;
+pub mod phase_harmonic;
