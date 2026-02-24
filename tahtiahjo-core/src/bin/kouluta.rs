@@ -94,6 +94,7 @@ fn main() {
     let mut käytä_d18 = false;
     let mut käytä_blend_fallback = false;
     let mut käytä_align_temp = false;
+    let mut käytä_align_keskus = false;
 
     for arg in &args[2..] {
         if let Some(val) = arg.strip_prefix("--chars=") {
@@ -157,6 +158,9 @@ fn main() {
             käytä_blend_fallback = true;
         } else if arg == "--align-temp" {
             käytä_align_temp = true;
+        } else if arg == "--align-keskus" {
+            käytä_align_keskus = true;
+            käytä_align_temp = true; // align-keskus implies align-temp
         }
     }
 
@@ -316,6 +320,7 @@ fn main() {
             no_dump,
             käytä_blend_fallback,
             käytä_align_temp,
+            käytä_align_keskus,
         );
         tulosta_lopputulos(tarkkuus);
     } else if käytä_kolmoset && käytä_keskus && käytä_bipyramid {
@@ -675,6 +680,7 @@ fn kouluta_kolmoset_kierto(
     no_dump: bool,
     blend_fallback: bool,
     align_temp: bool,
+    align_keskus: bool,
 ) -> f64 {
     // ── Build per-relay codebooks ─────────────────────────────────
     println!("\n  [Kierto] Building per-relay codebooks...");
@@ -831,6 +837,19 @@ fn kouluta_kolmoset_kierto(
         );
         println!("    PhaseHarmonic:                   {:.2}%  (Δflat = {:+.2}%)",
             tarkkuus_harm * 100.0, (tarkkuus_harm - tarkkuus_flat) * 100.0);
+        if align_keskus {
+            let mut harm_k = harmonizer.clone();
+            harm_k.reset_for_eval();
+            let mut keskus_k = Keskus::new(&aakkosto, koodikirja_oletus.clone(), ulottuvuus);
+            keskus_k.esikouluta(teksti);
+            let tarkkuus_ak = arvioi_kolmoset_harmonic_keskus_kierto(
+                &kolmoset, &mut harm_k, &mut keskus_k,
+                [&näytteet_a, &näytteet_b, &näytteet_c],
+                hdc, &aakkosto,
+            );
+            println!("    AlignTemp+Keskus:                {:.2}%  (Δflat = {:+.2}%)",
+                tarkkuus_ak * 100.0, (tarkkuus_ak - tarkkuus_flat) * 100.0);
+        }
         tulosta_harmonic_diagnostiikka(&harm_eval);
     }
 
@@ -867,6 +886,20 @@ fn kouluta_kolmoset_kierto(
         );
         println!("    PhaseHarmonic:      {:.2}%  (Δensemble = {:+.2}%)",
             tarkkuus_harm * 100.0, (tarkkuus_harm - tarkkuus_eval) * 100.0);
+
+        if align_keskus {
+            let mut harm_k = harmonizer.clone();
+            harm_k.reset_for_eval();
+            let mut keskus_k = Keskus::new(&aakkosto, koodikirja_oletus.clone(), ulottuvuus);
+            keskus_k.esikouluta(teksti);
+            let tarkkuus_ak = arvioi_kolmoset_harmonic_keskus_kierto(
+                &kolmoset, &mut harm_k, &mut keskus_k,
+                [&näytteet_a, &näytteet_b, &näytteet_c],
+                hdc, &aakkosto,
+            );
+            println!("    AlignTemp+Keskus:  {:.2}%  (Δensemble = {:+.2}%)",
+                tarkkuus_ak * 100.0, (tarkkuus_ak - tarkkuus_eval) * 100.0);
+        }
     }
 
     // ── PCV diagnostic after retraining ──────────────────────────
@@ -906,6 +939,19 @@ fn kouluta_kolmoset_kierto(
         if pcv { " (PCV)" } else { "" });
     println!("    PhaseHarmonic:     {:.2}%  (Δensemble = {:+.2}%)",
         loppu_harm * 100.0, (loppu_harm - loppu) * 100.0);
+    if align_keskus {
+        let mut harm_k = harmonizer.clone();
+        harm_k.reset_for_eval();
+        let mut keskus_k = Keskus::new(&aakkosto, koodikirja_oletus.clone(), ulottuvuus);
+        keskus_k.esikouluta(teksti);
+        let loppu_ak = arvioi_kolmoset_harmonic_keskus_kierto(
+            &kolmoset, &mut harm_k, &mut keskus_k,
+            [&näytteet_a, &näytteet_b, &näytteet_c],
+            hdc, &aakkosto,
+        );
+        println!("    AlignTemp+Keskus: {:.2}%  (Δensemble = {:+.2}%)",
+            loppu_ak * 100.0, (loppu_ak - loppu) * 100.0);
+    }
     println!("    Flat baseline:     {:.2}%", loppu_flat * 100.0);
     println!("    Diversity Δ:       {:+.2}%", (loppu - loppu_flat) * 100.0);
     tulosta_harmonic_diagnostiikka(&harm_final);
@@ -1549,6 +1595,92 @@ fn arvioi_kolmoset_harmonic_kierto(
 
         let actual_idx = char_to_idx.get(&kohde).copied().unwrap_or(0);
         harmonizer.record_result(&model_scores, actual_idx);
+    }
+
+    oikein as f64 / n as f64
+}
+
+/// Evaluate align-temp + Keskus transition priors in the kierto pipeline.
+/// Alignment modulates softmax temperature over the blend, THEN Keskus adds
+/// transition/frequency priors before final argmax.
+fn arvioi_kolmoset_harmonic_keskus_kierto(
+    kolmoset: &Kolmoset,
+    harmonizer: &mut PhaseHarmonizer,
+    keskus: &mut Keskus,
+    näytteet: [&[(Vec<f64>, char)]; 3],
+    hdc: &HdcPeruskäsitteet,
+    aakkosto: &[char],
+) -> f64 {
+    let n = näytteet[0].len();
+    if n == 0 {
+        return 0.0;
+    }
+    let mut oikein = 0usize;
+
+    let char_to_idx: HashMap<char, usize> = aakkosto.iter()
+        .enumerate()
+        .map(|(i, &c)| (c, i))
+        .collect();
+
+    for i in 0..n {
+        let kohde = näytteet[0][i].1;
+        let kontekstit = [
+            näytteet[0][i].0.as_slice(),
+            näytteet[1][i].0.as_slice(),
+            näytteet[2][i].0.as_slice(),
+        ];
+
+        // Per-relay score vectors
+        let relay_scores = kolmoset.per_relay_pisteet_kierto(kontekstit, hdc);
+        let model_scores: Vec<Vec<f64>> = relay_scores.to_vec();
+
+        // PhaseHarmonizer produces alignment-modulated blend (pred_idx unused — we use Keskus-adjusted)
+        let (_pred_idx, confidence, _alignment) = harmonizer.predict(&model_scores, None);
+
+        // Reconstruct the blended score vector for Keskus
+        // (accuracy-weighted blend, same as alignment_temp_prediction step A)
+        let num_chars = aakkosto.len();
+        let mut blended = vec![0.0; num_chars];
+        let mut total_w = 0.0;
+        for (j, dial) in harmonizer.dials.iter().enumerate() {
+            if j >= model_scores.len() { break; }
+            let acc = dial.recent_accuracy(200).max(0.01);
+            let w = acc * dial.weight;
+            total_w += w;
+            for c in 0..num_chars {
+                blended[c] += model_scores[j][c] * w;
+            }
+        }
+        if total_w > 1e-10 {
+            for c in 0..num_chars {
+                blended[c] /= total_w;
+            }
+        }
+
+        // Apply Keskus transition priors to the blended scores
+        let adjusted = keskus.sovella_pistevektori(&blended);
+
+        // Final prediction: argmax of adjusted scores
+        let (final_idx, _) = adjusted.iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
+            .unwrap_or((0, &0.0));
+
+        let ennuste = if final_idx < aakkosto.len() {
+            aakkosto[final_idx]
+        } else {
+            ' '
+        };
+
+        if ennuste == kohde {
+            oikein += 1;
+        }
+
+        let actual_idx = char_to_idx.get(&kohde).copied().unwrap_or(0);
+        harmonizer.record_result(&model_scores, actual_idx);
+
+        // Update Keskus with actual result for transition learning
+        keskus.päivitä(ennuste, kohde, kontekstit[0], confidence, hdc);
     }
 
     oikein as f64 / n as f64
