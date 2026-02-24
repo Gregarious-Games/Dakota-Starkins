@@ -304,6 +304,51 @@ impl Arc {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// CALIBRATION — Expected Calibration Error (ECE) per dial
+// ─────────────────────────────────────────────────────────────────────────────
+// Inspired by quantum_collective's introspection.rs:
+// When a dial says "I'm 80% confident", is it actually right 80% of the time?
+// 10 bins bucket predictions by confidence, track actual accuracy per bin.
+// ECE = weighted mean of |avg_confidence_in_bin - actual_accuracy_in_bin|.
+// Well-calibrated dials get more weight in blending.
+
+const NUM_CALIBRATION_BINS: usize = 10;
+
+#[derive(Clone, Debug)]
+pub struct CalibrationBin {
+    /// Number of predictions bucketed into this bin
+    pub count: usize,
+    /// Sum of confidence values (softmax probability of predicted char)
+    pub sum_confidence: f64,
+    /// Number of correct predictions in this bin
+    pub correct: usize,
+}
+
+impl CalibrationBin {
+    pub fn new() -> Self {
+        CalibrationBin { count: 0, sum_confidence: 0.0, correct: 0 }
+    }
+
+    pub fn add(&mut self, confidence: f64, was_correct: bool) {
+        self.count += 1;
+        self.sum_confidence += confidence;
+        if was_correct { self.correct += 1; }
+    }
+
+    pub fn mean_confidence(&self) -> f64 {
+        if self.count > 0 { self.sum_confidence / self.count as f64 } else { 0.0 }
+    }
+
+    pub fn accuracy(&self) -> f64 {
+        if self.count > 0 { self.correct as f64 / self.count as f64 } else { 0.0 }
+    }
+
+    pub fn calibration_error(&self) -> f64 {
+        (self.mean_confidence() - self.accuracy()).abs()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // DIAL — A Single Model's Resolution Layer
 // ─────────────────────────────────────────────────────────────────────────────
 // Each Dial divides the same circle at its own granularity.
@@ -370,6 +415,10 @@ pub struct Dial {
     pub conjugate_id: Option<usize>,
     /// Is this the forward (+) or reverse (-) dial in the pair?
     pub polarity: f64, // +1.0 or -1.0
+
+    // === Calibration (ECE tracking) ===
+    /// 10 calibration bins: bin[i] holds predictions where confidence ∈ [i/10, (i+1)/10)
+    pub calibration_bins: Vec<CalibrationBin>,
 }
 
 impl Dial {
@@ -396,7 +445,37 @@ impl Dial {
             anchored: false,
             conjugate_id: None,
             polarity: 1.0,
+            calibration_bins: (0..NUM_CALIBRATION_BINS).map(|_| CalibrationBin::new()).collect(),
         }
+    }
+
+    /// Record a calibration sample: dial's confidence vs actual correctness
+    pub fn record_calibration(&mut self, confidence: f64, was_correct: bool) {
+        let bin_idx = ((confidence * NUM_CALIBRATION_BINS as f64).floor() as usize)
+            .min(NUM_CALIBRATION_BINS - 1);
+        self.calibration_bins[bin_idx].add(confidence, was_correct);
+    }
+
+    /// Compute Expected Calibration Error for this dial
+    /// ECE = Σ (bin_weight × |mean_confidence - accuracy|) over non-empty bins
+    /// Returns value in [0, 1]: 0 = perfectly calibrated, 1 = maximally miscalibrated
+    pub fn ece(&self) -> f64 {
+        let total_samples: usize = self.calibration_bins.iter().map(|b| b.count).sum();
+        if total_samples == 0 { return 0.5; } // No data → assume moderate miscalibration
+
+        let mut ece = 0.0;
+        for bin in &self.calibration_bins {
+            if bin.count > 0 {
+                let weight = bin.count as f64 / total_samples as f64;
+                ece += weight * bin.calibration_error();
+            }
+        }
+        ece.clamp(0.0, 1.0)
+    }
+
+    /// Calibration score: 1.0 - ECE (higher is better)
+    pub fn calibration_score(&self) -> f64 {
+        1.0 - self.ece()
     }
 
     /// Capture the identity anchor — call this after initial warmup
@@ -629,6 +708,18 @@ pub struct PhaseHarmonizer {
     pub unaligned_total: u64,
     /// Last prediction's alignment state (for record_result feedback)
     pub last_was_aligned: bool,
+
+    // === ECE-Weighted Blending ===
+    /// When true, dial weights incorporate calibration quality (ECE)
+    /// Well-calibrated dials get boosted, overconfident dials get penalized
+    pub ece_weights: bool,
+
+    // === Entropy-Gated Blending ===
+    /// When true, each dial's weight is dynamically modulated per-prediction
+    /// by the inverse of its score distribution entropy.
+    /// Low entropy (confident dial) → high weight. High entropy → low weight.
+    /// This is DYNAMIC (per-prediction) vs accuracy which is STATIC (rolling).
+    pub entropy_gate: bool,
 }
 
 impl PhaseHarmonizer {
@@ -692,7 +783,25 @@ impl PhaseHarmonizer {
             unaligned_correct: 0,
             unaligned_total: 0,
             last_was_aligned: false,
+            ece_weights: false,
+            entropy_gate: false,
         }
+    }
+
+    /// Compute Shannon entropy of a score distribution (after softmax with given temp)
+    fn distribution_entropy(scores: &[f64], temperature: f64) -> f64 {
+        let max_s = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let exps: Vec<f64> = scores.iter().map(|&s| ((s - max_s) / temperature).exp()).collect();
+        let sum: f64 = exps.iter().sum();
+        if sum < 1e-10 { return 0.0; }
+        let mut entropy = 0.0;
+        for &e in &exps {
+            let p = e / sum;
+            if p > 1e-15 {
+                entropy -= p * p.ln();
+            }
+        }
+        entropy
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -910,8 +1019,21 @@ impl PhaseHarmonizer {
             let family_base = self.temporal.family_weight(dial_id);
             let family_weight = family_base.powf(accuracy); // base^accuracy ∈ [1.0, base]
 
+            let mut w = dial.weight * family_weight;
+            if self.ece_weights {
+                w *= 0.5 + dial.calibration_score();
+            }
+            if self.entropy_gate {
+                let max_entropy = (n as f64).ln();
+                if max_entropy > 1e-10 {
+                    let ent = Self::distribution_entropy(&all_scores[dial_id], dial.temperature);
+                    let norm_ent = (ent / max_entropy).clamp(0.0, 1.0);
+                    w *= 1.0 + PHI_INV * (1.0 - norm_ent);
+                }
+            }
+
             for c in 0..n {
-                combined[c] += all_scores[dial_id][c] * dial.weight * family_weight;
+                combined[c] += all_scores[dial_id][c] * w;
             }
         }
 
@@ -982,10 +1104,24 @@ impl PhaseHarmonizer {
         let mut combined = vec![0.0; n];
         let mut total_weight = 0.0;
 
+        // Pre-compute entropy weights if gating is active
+        let max_entropy = (n as f64).ln(); // Maximum possible entropy (uniform distribution)
+
         for (i, dial) in self.dials.iter().enumerate() {
             if i >= all_scores.len() { break; }
             let acc = dial.recent_accuracy(200).max(0.01);
-            let w = acc * dial.weight;
+            let mut w = acc * dial.weight;
+            if self.ece_weights {
+                w *= 0.5 + dial.calibration_score();
+            }
+            if self.entropy_gate && max_entropy > 1e-10 {
+                let ent = Self::distribution_entropy(&all_scores[i], dial.temperature);
+                // Inverse entropy weight: confident dial → low entropy → high weight
+                // normalized_entropy ∈ [0, 1], inverse ∈ [1, ∞) but clamped
+                let norm_ent = (ent / max_entropy).clamp(0.0, 1.0);
+                let entropy_factor = 1.0 + PHI_INV * (1.0 - norm_ent); // range: [1.0, 1.618]
+                w *= entropy_factor;
+            }
             total_weight += w;
             for c in 0..n {
                 combined[c] += all_scores[i][c] * w;
@@ -1031,10 +1167,20 @@ impl PhaseHarmonizer {
         // Step A: Accuracy-weighted blend of ALL dials (always use all information)
         let mut combined = vec![0.0; n];
         let mut total_weight = 0.0;
+        let max_entropy = (n as f64).ln();
         for (i, dial) in self.dials.iter().enumerate() {
             if i >= all_scores.len() { break; }
             let acc = dial.recent_accuracy(200).max(0.01);
-            let w = acc * dial.weight;
+            let mut w = acc * dial.weight;
+            if self.ece_weights {
+                w *= 0.5 + dial.calibration_score();
+            }
+            if self.entropy_gate && max_entropy > 1e-10 {
+                let ent = Self::distribution_entropy(&all_scores[i], dial.temperature);
+                let norm_ent = (ent / max_entropy).clamp(0.0, 1.0);
+                let entropy_factor = 1.0 + PHI_INV * (1.0 - norm_ent);
+                w *= entropy_factor;
+            }
             total_weight += w;
             for c in 0..n {
                 combined[c] += all_scores[i][c] * w;
@@ -1543,16 +1689,28 @@ impl PhaseHarmonizer {
         model_scores: &[Vec<f64>],
         actual_index: usize,
     ) {
-        // Per-dial accuracy tracking
+        // Per-dial accuracy + calibration tracking
         for (i, dial) in self.dials.iter_mut().enumerate() {
             if i < model_scores.len() {
-                let dial_prediction = model_scores[i]
+                let scores = &model_scores[i];
+                let dial_prediction = scores
                     .iter()
                     .enumerate()
                     .max_by(|(_, a), (_, b)| a.total_cmp(b))
                     .map(|(idx, _)| idx)
                     .unwrap_or(0);
-                dial.record_accuracy(dial_prediction == actual_index);
+                let correct = dial_prediction == actual_index;
+                dial.record_accuracy(correct);
+
+                // ECE calibration: compute dial's softmax confidence for its prediction
+                let max_score = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let sum_exp: f64 = scores.iter().map(|&s| ((s - max_score) / dial.temperature).exp()).sum();
+                let confidence = if sum_exp > 1e-10 {
+                    ((scores[dial_prediction] - max_score) / dial.temperature).exp() / sum_exp
+                } else {
+                    1.0 / scores.len() as f64
+                };
+                dial.record_calibration(confidence, correct);
             }
         }
 
@@ -1605,6 +1763,10 @@ impl PhaseHarmonizer {
         self.temporal = TemporalPhaseTracker::new(num_dials, 200);
         for dial in &mut self.dials {
             dial.accuracy_history.clear();
+            // Reset calibration bins for fresh eval (don't carry stale calibration)
+            for bin in &mut dial.calibration_bins {
+                *bin = CalibrationBin::new();
+            }
         }
         // Reset adaptive temp counters but KEEP learned temp_hot/temp_cold
         self.aligned_correct = 0;
@@ -1625,6 +1787,19 @@ impl PhaseHarmonizer {
     /// High alignment → low temp (sharp). Low alignment → high temp (hedge).
     pub fn set_alignment_temperature(&mut self, enabled: bool) {
         self.alignment_temperature = enabled;
+    }
+
+    /// Enable ECE-weighted blending: well-calibrated dials get more weight,
+    /// overconfident dials get less. Based on quantum_collective's ECE framework.
+    pub fn set_ece_weights(&mut self, enabled: bool) {
+        self.ece_weights = enabled;
+    }
+
+    /// Enable entropy-gated blending: each dial's weight is dynamically
+    /// modulated per-prediction by the inverse of its score entropy.
+    /// Confident dials (low entropy) get boosted, uncertain dials get dampened.
+    pub fn set_entropy_gate(&mut self, enabled: bool) {
+        self.entropy_gate = enabled;
     }
 }
 
@@ -2212,6 +2387,34 @@ mod tests {
         let thresholds: Vec<f64> = h.dials.iter().map(|d| d.coupling_threshold).collect();
         let all_same = thresholds.windows(2).all(|w| (w[0] - w[1]).abs() < 1e-10);
         assert!(!all_same, "Coupling thresholds should vary with hex topology");
+    }
+
+    #[test]
+    fn test_calibration_bins() {
+        let mut dial = Dial::new(0, "Test", 12, 37);
+
+        // A perfectly calibrated dial: confidence matches accuracy
+        for _ in 0..100 {
+            dial.record_calibration(0.75, true);  // 75% confident, correct
+        }
+        for _ in 0..33 {
+            dial.record_calibration(0.75, false); // 75% confident, wrong
+        }
+        // ~100/133 = 75% accuracy in the 0.7-0.8 bin → well calibrated
+        let ece = dial.ece();
+        assert!(ece < 0.05, "Well-calibrated dial should have low ECE, got {:.4}", ece);
+
+        // A miscalibrated dial: says 90% confident but only 50% accurate
+        let mut bad_dial = Dial::new(1, "Bad", 12, 37);
+        for _ in 0..50 {
+            bad_dial.record_calibration(0.95, true);
+        }
+        for _ in 0..50 {
+            bad_dial.record_calibration(0.95, false);
+        }
+        let bad_ece = bad_dial.ece();
+        assert!(bad_ece > 0.3, "Overconfident dial should have high ECE, got {:.4}", bad_ece);
+        assert!(bad_ece > ece, "Overconfident ECE ({:.4}) should exceed calibrated ({:.4})", bad_ece, ece);
     }
 
     #[test]

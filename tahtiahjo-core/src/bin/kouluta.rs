@@ -95,6 +95,8 @@ fn main() {
     let mut käytä_blend_fallback = false;
     let mut käytä_align_temp = false;
     let mut käytä_align_keskus = false;
+    let mut käytä_ece_weights = false;
+    let mut käytä_entropy_gate = false;
 
     for arg in &args[2..] {
         if let Some(val) = arg.strip_prefix("--chars=") {
@@ -161,6 +163,10 @@ fn main() {
         } else if arg == "--align-keskus" {
             käytä_align_keskus = true;
             käytä_align_temp = true; // align-keskus implies align-temp
+        } else if arg == "--ece-weights" {
+            käytä_ece_weights = true;
+        } else if arg == "--entropy-gate" {
+            käytä_entropy_gate = true;
         }
     }
 
@@ -321,6 +327,8 @@ fn main() {
             käytä_blend_fallback,
             käytä_align_temp,
             käytä_align_keskus,
+            käytä_ece_weights,
+            käytä_entropy_gate,
         );
         tulosta_lopputulos(tarkkuus);
     } else if käytä_kolmoset && käytä_keskus && käytä_bipyramid {
@@ -681,6 +689,8 @@ fn kouluta_kolmoset_kierto(
     blend_fallback: bool,
     align_temp: bool,
     align_keskus: bool,
+    ece_weights: bool,
+    entropy_gate: bool,
 ) -> f64 {
     // ── Build per-relay codebooks ─────────────────────────────────
     println!("\n  [Kierto] Building per-relay codebooks...");
@@ -826,6 +836,14 @@ fn kouluta_kolmoset_kierto(
     if align_temp {
         harmonizer.set_alignment_temperature(true);
         println!("    [PhaseHarmonic] Alignment-temperature mode: ON");
+    }
+    if ece_weights {
+        harmonizer.set_ece_weights(true);
+        println!("    [PhaseHarmonic] ECE-weighted blending: ON");
+    }
+    if entropy_gate {
+        harmonizer.set_entropy_gate(true);
+        println!("    [PhaseHarmonic] Entropy-gated blending: ON");
     }
     {
         let mut harm_eval = harmonizer.clone();
@@ -1712,11 +1730,17 @@ fn tulosta_harmonic_diagnostiikka(harmonizer: &PhaseHarmonizer) {
             aligned_acc * 100.0, harmonizer.aligned_correct, harmonizer.aligned_total,
             unaligned_acc * 100.0, harmonizer.unaligned_correct, harmonizer.unaligned_total);
     }
-    for ds in &diag.dial_states {
-        println!("      [{}] δ={} T={:.2} w={:.3} acc={:.3} {}{}",
+    for (i, ds) in diag.dial_states.iter().enumerate() {
+        let ece_str = if harmonizer.ece_weights && i < harmonizer.dials.len() {
+            format!(" ECE={:.3} cal={:.3}", harmonizer.dials[i].ece(), harmonizer.dials[i].calibration_score())
+        } else {
+            String::new()
+        };
+        println!("      [{}] δ={} T={:.2} w={:.3} acc={:.3} {}{}{}",
             ds.name, ds.delta, ds.temperature, ds.weight, ds.recent_accuracy,
             if ds.in_phi_mode { "φ" } else { "√3" },
-            if ds.has_conjugate { " ⇄" } else { "" });
+            if ds.has_conjugate { " ⇄" } else { "" },
+            ece_str);
     }
 }
 
