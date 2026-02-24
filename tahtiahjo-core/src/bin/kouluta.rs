@@ -99,6 +99,7 @@ fn main() {
     let mut käytä_entropy_gate = false;
     let mut käytä_meta_ensemble = false;
     let mut käytä_mixed_window = false;
+    let mut mixed_windows: (usize, usize, usize) = (3, 4, 5);
 
     for arg in &args[2..] {
         if let Some(val) = arg.strip_prefix("--chars=") {
@@ -173,6 +174,16 @@ fn main() {
             käytä_meta_ensemble = true;
         } else if arg == "--mixed-window" {
             käytä_mixed_window = true;
+        } else if let Some(val) = arg.strip_prefix("--mixed-window=") {
+            käytä_mixed_window = true;
+            let parts: Vec<&str> = val.split(',').collect();
+            if parts.len() == 3 {
+                mixed_windows = (
+                    parts[0].parse().unwrap_or(3),
+                    parts[1].parse().unwrap_or(4),
+                    parts[2].parse().unwrap_or(5),
+                );
+            }
         }
     }
 
@@ -337,6 +348,7 @@ fn main() {
             käytä_entropy_gate,
             käytä_meta_ensemble,
             käytä_mixed_window,
+            mixed_windows,
         );
         tulosta_lopputulos(tarkkuus);
     } else if käytä_kolmoset && käytä_keskus && käytä_bipyramid {
@@ -701,6 +713,7 @@ fn kouluta_kolmoset_kierto(
     entropy_gate: bool,
     meta_ensemble: bool,
     mixed_window: bool,
+    mixed_window_sizes: (usize, usize, usize),
 ) -> f64 {
     // ── Build per-relay codebooks ─────────────────────────────────
     println!("\n  [Kierto] Building per-relay codebooks...");
@@ -749,10 +762,11 @@ fn kouluta_kolmoset_kierto(
     //   B: window=3 (trigrams — standard)
     //   C: window=5 (quintigrams — longer-range structure)
     let (näytteet_a, näytteet_b, näytteet_c) = if mixed_window {
-        println!("  [Kierto] Building MIXED-WINDOW context vectors (A=3, B=4, C=5)...");
-        let sitoja_a = KontekstiSitoja::new(3);
-        let sitoja_b = KontekstiSitoja::new(4);
-        let sitoja_c = KontekstiSitoja::new(5);
+        let (wa, wb, wc) = mixed_window_sizes;
+        println!("  [Kierto] Building MIXED-WINDOW context vectors (A={}, B={}, C={})...", wa, wb, wc);
+        let sitoja_a = KontekstiSitoja::new(wa);
+        let sitoja_b = KontekstiSitoja::new(wb);
+        let sitoja_c = KontekstiSitoja::new(wc);
         (
             rakenna_näytteet(teksti, &kirjat[0], &sitoja_a, hdc),
             rakenna_näytteet(teksti, &kirjat[1], &sitoja_b, hdc),

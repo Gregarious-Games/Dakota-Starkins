@@ -137,29 +137,19 @@ impl KontekstiSitoja {
         let mut kontekstit: Vec<Hypervektori> = Vec::new();
         let mut painot: Vec<f64> = Vec::new();
 
-        // Unigram: just the most recent character
+        // Unigram: just the most recent character (weight 1.0)
         kontekstit.push(vektorit[n - 1].to_vec());
         painot.push(1.0);
 
-        // Bigram: last 2 characters, position-encoded
-        if n >= 2 {
-            let bigrammi = self.sido_konteksti(&vektorit[n - 2..], hdc);
-            kontekstit.push(bigrammi);
-            painot.push(PHI);
-        }
-
-        // Trigram: last 3 characters, position-encoded
-        if n >= 3 && self.ikkuna >= 3 {
-            let trigrammi = self.sido_konteksti(&vektorit[n - 3..], hdc);
-            kontekstit.push(trigrammi);
-            painot.push(PHI * PHI);
-        }
-
-        // 4-gram: last 4 characters (if window allows)
-        if n >= 4 && self.ikkuna >= 4 {
-            let nelogrammi = self.sido_konteksti(&vektorit[n - 4..], hdc);
-            kontekstit.push(nelogrammi);
-            painot.push(PHI * PHI * PHI);
+        // k-gram for k=2..=window: position-encoded, φ^(k-1) weighted
+        let mut phi_k = PHI;
+        for k in 2..=self.ikkuna {
+            if n >= k {
+                let kgrammi = self.sido_konteksti(&vektorit[n - k..], hdc);
+                kontekstit.push(kgrammi);
+                painot.push(phi_k);
+                phi_k *= PHI;
+            }
         }
 
         // Bundle with φ-weights → sign normalize
