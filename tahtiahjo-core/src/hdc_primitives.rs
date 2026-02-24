@@ -233,6 +233,36 @@ impl HdcPeruskäsitteet {
 // VECTOR UTILITIES
 // ═══════════════════════════════════════════════════════════════════
 
+// ═══════════════════════════════════════════════════════════════════
+// GIVENS ROTATION — Phase conjugate relay rotation
+// ═══════════════════════════════════════════════════════════════════
+
+/// Fast Givens rotation — only modifies dimensions i and j. O(D).
+///
+/// Rotates vector v by angle theta in the (i, j) plane.
+/// Cosine similarity is frame-invariant under orthogonal rotation,
+/// so no inverse rotation is needed at eval time (mirror principle).
+pub fn rotate_vector_fast(v: &[f64], i: usize, j: usize, cos_t: f64, sin_t: f64) -> Hypervektori {
+    let mut tulos = v.to_vec();
+    let vi = v[i];
+    let vj = v[j];
+    tulos[i] = cos_t * vi - sin_t * vj;
+    tulos[j] = sin_t * vi + cos_t * vj;
+    tulos
+}
+
+/// Rotate all vectors in a codebook by angle theta in the (i, j) plane.
+pub fn rotate_codebook(
+    codebook: &std::collections::HashMap<char, Hypervektori>,
+    i: usize, j: usize, theta: f64,
+) -> std::collections::HashMap<char, Hypervektori> {
+    let cos_t = theta.cos();
+    let sin_t = theta.sin();
+    codebook.iter()
+        .map(|(&c, v)| (c, rotate_vector_fast(v, i, j, cos_t, sin_t)))
+        .collect()
+}
+
 /// Random unit hypervector — unique starting identity.
 ///
 /// Uses Gaussian components normalized to unit length.
@@ -491,5 +521,39 @@ mod tests {
             "decoded with key_a should match val_a: sim_a={sim_aa} sim_b={sim_ab}");
         assert!(sim_aa > 0.3,
             "decoded similarity should be substantial: {sim_aa}");
+    }
+
+    #[test]
+    fn test_givens_rotation_preserves_norm() {
+        let v = vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let theta = std::f64::consts::PI / 3.0; // 60°
+        let rotated = rotate_vector_fast(&v, 0, 1, theta.cos(), theta.sin());
+        let norm: f64 = rotated.iter().map(|x| x * x).sum::<f64>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-10, "rotation must preserve norm, got {norm}");
+    }
+
+    #[test]
+    fn test_givens_rotation_120_degrees() {
+        // 120° rotation: cos(2π/3) = -0.5, sin(2π/3) = √3/2
+        let v = vec![1.0, 0.0, 0.0, 0.0];
+        let theta = 2.0 * std::f64::consts::PI / 3.0;
+        let rotated = rotate_vector_fast(&v, 0, 1, theta.cos(), theta.sin());
+        assert!((rotated[0] - (-0.5)).abs() < 1e-10);
+        assert!((rotated[1] - (3.0_f64.sqrt() / 2.0)).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_rotate_codebook_cosine_invariant() {
+        // Cosine similarity is frame-invariant under orthogonal rotation
+        let hdc = HdcPeruskäsitteet::new(ULOTTUVUUS, 42);
+        let mut book = std::collections::HashMap::new();
+        let mut rng = Siemen::new(42);
+        book.insert('a', rng.bipolaarinen_vektori(ULOTTUVUUS));
+        book.insert('b', rng.bipolaarinen_vektori(ULOTTUVUUS));
+        let sim_before = hdc.samankaltaisuus(&book[&'a'], &book[&'b']);
+        let rotated = rotate_codebook(&book, 0, 1, 2.0 * std::f64::consts::PI / 3.0);
+        let sim_after = hdc.samankaltaisuus(&rotated[&'a'], &rotated[&'b']);
+        assert!((sim_before - sim_after).abs() < 1e-10,
+            "cosine must be rotation-invariant: before={sim_before} after={sim_after}");
     }
 }

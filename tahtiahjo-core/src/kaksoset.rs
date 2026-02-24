@@ -423,6 +423,12 @@ pub struct KaksoisKertymä {
     pub prototyypit: HashMap<char, Hypervektori>,
     /// Number of samples accumulated per class.
     laskurit: HashMap<char, usize>,
+    /// Golden-mean damping coefficient ψ. 0.0 = no damping (default).
+    /// When > 0, update weight scales as 1/(1 + count × ψ).
+    /// Prevents prototype drift at scale: early samples establish direction,
+    /// later samples contribute diminishing corrections.
+    /// Recommended: ψ = Γ = 1/(6φ) ≈ 0.103
+    pub vaimennus: f64,
 }
 
 impl KaksoisKertymä {
@@ -433,26 +439,45 @@ impl KaksoisKertymä {
             prototyypit.insert(c, vec![0.0; ulottuvuus]);
             laskurit.insert(c, 0);
         }
-        Self { prototyypit, laskurit }
+        Self { prototyypit, laskurit, vaimennus: 0.0 }
     }
 
     /// Accumulate a context vector into a character's prototype.
     /// Weight can be modulated by hormones.
+    ///
+    /// When vaimennus > 0 (golden-mean damping), the effective weight
+    /// decays as 1/(1 + count × ψ). This prevents prototype drift:
+    /// early samples establish the geometric direction, later samples
+    /// contribute diminishing corrections rather than overwhelming
+    /// the learned structure.
     pub fn kerrytä(&mut self, merkki: char, konteksti: &[f64], paino: f64) {
         if let Some(proto) = self.prototyypit.get_mut(&merkki) {
+            let laskuri = self.laskurit.entry(merkki).or_insert(0);
+            let tehokas_paino = if self.vaimennus > 0.0 {
+                paino / (1.0 + *laskuri as f64 * self.vaimennus)
+            } else {
+                paino
+            };
             for (p, &k) in proto.iter_mut().zip(konteksti.iter()) {
-                *p += paino * k;
+                *p += tehokas_paino * k;
             }
-            *self.laskurit.entry(merkki).or_insert(0) += 1;
+            *laskuri += 1;
         }
     }
 
     /// Subtract a context vector from a character's prototype.
     /// Used by Kielto to anti-learn confused predictions.
+    /// Damping applies here too — prevents anti-prototypes from drifting.
     pub fn vähennä(&mut self, merkki: char, konteksti: &[f64], paino: f64) {
         if let Some(proto) = self.prototyypit.get_mut(&merkki) {
+            let count = *self.laskurit.get(&merkki).unwrap_or(&0);
+            let tehokas_paino = if self.vaimennus > 0.0 {
+                paino / (1.0 + count as f64 * self.vaimennus)
+            } else {
+                paino
+            };
             for (p, &k) in proto.iter_mut().zip(konteksti.iter()) {
-                *p -= paino * k;
+                *p -= tehokas_paino * k;
             }
         }
     }

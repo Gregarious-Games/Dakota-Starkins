@@ -28,10 +28,13 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 
-use tahtiahjo_core::hdc_primitives::{HdcPeruskäsitteet, Hypervektori, ULOTTUVUUS};
+use tahtiahjo_core::hdc_primitives::{HdcPeruskäsitteet, Hypervektori, ULOTTUVUUS, rotate_codebook};
 use tahtiahjo_core::konteksti_sitoja::KontekstiSitoja;
 use tahtiahjo_core::luokka_kertyma::{LuokkaKertymä, luo_satunnainen_koodikirja};
-use tahtiahjo_core::qams_codebook::{kaikki_allekirjoitukset, luo_koodikirja};
+use tahtiahjo_core::qams_codebook::{
+    kaikki_allekirjoitukset, luo_koodikirja, luo_koodikirja_painotettu,
+    ÄänneAllekirjoitus, PAINOT_RELE_A, PAINOT_RELE_B, PAINOT_RELE_C,
+};
 use tahtiahjo_core::kaksoset::Kaksoset;
 use tahtiahjo_core::kolmoset::Kolmoset;
 use tahtiahjo_core::keskus::Keskus;
@@ -67,6 +70,22 @@ fn main() {
     // Dimension override (default uses ULOTTUVUUS=256)
     let mut ulottuvuus: usize = ULOTTUVUUS;
 
+    // Golden-mean damping coefficient (0.0 = off)
+    let mut vaimennus: f64 = 0.0;
+
+    // Phase conjugate relay rotation
+    let mut käytä_rotation = false;
+    let mut rotation_plane: (usize, usize) = (0, 1);
+
+    // QAMS phonetic specialization
+    let mut käytä_qams_specialize = false;
+
+    // Phase Conjugate Voting
+    let mut käytä_pcv = false;
+
+    // No relay dump (parallel independent training)
+    let mut no_dump = false;
+
     for arg in &args[2..] {
         if let Some(val) = arg.strip_prefix("--chars=") {
             max_merkit = val.parse().unwrap_or(10_000);
@@ -99,6 +118,24 @@ fn main() {
             käytä_bipyramid = true;
         } else if let Some(val) = arg.strip_prefix("--dim=") {
             ulottuvuus = val.parse().unwrap_or(ULOTTUVUUS);
+        } else if let Some(val) = arg.strip_prefix("--damping=") {
+            vaimennus = val.parse().unwrap_or(0.0);
+        } else if arg == "--rotation" {
+            käytä_rotation = true;
+        } else if let Some(val) = arg.strip_prefix("--rotation-plane=") {
+            let parts: Vec<&str> = val.split(',').collect();
+            if parts.len() == 2 {
+                let i = parts[0].parse().unwrap_or(0);
+                let j = parts[1].parse().unwrap_or(1);
+                rotation_plane = (i, j);
+            }
+            käytä_rotation = true;
+        } else if arg == "--qams-specialize" || arg == "--qams-spec" {
+            käytä_qams_specialize = true;
+        } else if arg == "--pcv" {
+            käytä_pcv = true;
+        } else if arg == "--no-dump" {
+            no_dump = true;
         }
     }
 
@@ -119,8 +156,21 @@ fn main() {
     println!("  Codebook:   {}", koodikirja_tyyppi);
     println!("  Retrain:    {} passes", uudelleen);
     println!("  Dimension:  D={}", ulottuvuus);
+    if vaimennus > 0.0 {
+        println!("  Damping:    ψ={:.6} (golden-mean drift brake)", vaimennus);
+    }
     if vertaa {
         println!("  Mode:       COMPARE (all architectures)");
+    } else if käytä_kolmoset && (käytä_rotation || käytä_qams_specialize || käytä_pcv || no_dump) {
+        let mut mode_parts = vec!["KOLMOSET"];
+        if käytä_rotation { mode_parts.push("ROTATION"); }
+        if käytä_qams_specialize { mode_parts.push("QAMS-SPEC"); }
+        if käytä_pcv { mode_parts.push("PCV"); }
+        if no_dump { mode_parts.push("NO-DUMP"); }
+        println!("  Mode:       {} (per-relay diversity)", mode_parts.join(" + "));
+        if käytä_rotation {
+            println!("  Rotation:   plane=({},{}) at 0°/120°/240°", rotation_plane.0, rotation_plane.1);
+        }
     } else if käytä_kolmoset && käytä_keskus && käytä_bipyramid {
         println!("  Mode:       KOLMOSET + KESKUS + BIPYRAMID (2-stage pole prediction)");
     } else if käytä_kolmoset && käytä_keskus {
@@ -167,7 +217,7 @@ fn main() {
             &teksti, &koodikirja, &sitoja, &mut hdc, uudelleen, ulottuvuus,
         );
         let tarkkuus_km = kouluta_kolmoset(
-            &teksti, &koodikirja, &sitoja, &mut hdc, uudelleen, ulottuvuus,
+            &teksti, &koodikirja, &sitoja, &mut hdc, uudelleen, ulottuvuus, vaimennus,
         );
 
         println!("\n═══════════════════════════════════════════════════════════════");
@@ -187,6 +237,20 @@ fn main() {
             println!("  >>> LuokkaKertymä wins");
         }
         println!("═══════════════════════════════════════════════════════════════");
+    } else if käytä_kolmoset && (käytä_rotation || käytä_qams_specialize || käytä_pcv || no_dump) {
+        // ═══════════════════════════════════════════════════════════════
+        // KOLMOSET + ROTATION / QAMS SPECIALIZATION / PCV MODE
+        // ═══════════════════════════════════════════════════════════════
+        let allekirjoitukset = kaikki_allekirjoitukset();
+        let tarkkuus = kouluta_kolmoset_kierto(
+            &teksti, &allekirjoitukset, &koodikirja, &sitoja, &mut hdc,
+            uudelleen, ulottuvuus, vaimennus,
+            if käytä_rotation { Some(rotation_plane) } else { None },
+            käytä_qams_specialize,
+            käytä_pcv,
+            no_dump,
+        );
+        tulosta_lopputulos(tarkkuus);
     } else if käytä_kolmoset && käytä_keskus && käytä_bipyramid {
         // ═══════════════════════════════════════════════════════════════
         // KOLMOSET + KESKUS + BIPYRAMID MODE
@@ -194,7 +258,7 @@ fn main() {
         let alpha_overrides = (alpha_siirtyma, alpha_taajuus, alpha_kierto, alpha_sana);
         let tarkkuus = kouluta_kolmoset_keskus_kaksoisnapainen(
             &teksti, &koodikirja, &sitoja, &mut hdc, uudelleen,
-            alpha_overrides, bipyramid_threshold, ulottuvuus,
+            alpha_overrides, bipyramid_threshold, ulottuvuus, vaimennus,
         );
         tulosta_lopputulos(tarkkuus);
     } else if käytä_kolmoset && käytä_keskus {
@@ -203,7 +267,7 @@ fn main() {
         // ═══════════════════════════════════════════════════════════════
         let alpha_overrides = (alpha_siirtyma, alpha_taajuus, alpha_kierto, alpha_sana);
         let tarkkuus = kouluta_kolmoset_keskus(
-            &teksti, &koodikirja, &sitoja, &mut hdc, uudelleen, alpha_overrides, ulottuvuus,
+            &teksti, &koodikirja, &sitoja, &mut hdc, uudelleen, alpha_overrides, ulottuvuus, vaimennus,
         );
         tulosta_lopputulos(tarkkuus);
     } else if käytä_kolmoset {
@@ -211,7 +275,7 @@ fn main() {
         // KOLMOSET MODE
         // ═══════════════════════════════════════════════════════════════
         let tarkkuus = kouluta_kolmoset(
-            &teksti, &koodikirja, &sitoja, &mut hdc, uudelleen, ulottuvuus,
+            &teksti, &koodikirja, &sitoja, &mut hdc, uudelleen, ulottuvuus, vaimennus,
         );
         tulosta_lopputulos(tarkkuus);
     } else if käytä_kaksoset {
@@ -423,6 +487,7 @@ fn kouluta_kolmoset(
     hdc: &mut HdcPeruskäsitteet,
     uudelleen: usize,
     ulottuvuus: usize,
+    vaimennus: f64,
 ) -> f64 {
     // Build all (context, target) samples
     println!("\n  [Kolmoset] Building context vectors...");
@@ -445,6 +510,12 @@ fn kouluta_kolmoset(
     let mut kolmoset = Kolmoset::new_custom(
         &aakkosto, ulottuvuus, askeleet_a, askeleet_b, askeleet_c,
     );
+
+    // Apply golden-mean damping if requested
+    if vaimennus > 0.0 {
+        kolmoset.aseta_vaimennus(vaimennus);
+        println!("    Damping: ψ={:.6}", vaimennus);
+    }
 
     // ── Single-pass training with relay ──────────────────────────
     println!("\n  [Kolmoset] Training (relay cascade)...");
@@ -485,6 +556,244 @@ fn kouluta_kolmoset(
     println!("\n  [Kolmoset] Final state:");
     println!("    A trust={:.3}  B trust={:.3}  C trust={:.3}",
         loppu_tila.a_luottamus, loppu_tila.b_luottamus, loppu_tila.c_luottamus);
+
+    loppu
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// KOLMOSET + ROTATION / QAMS SPECIALIZATION PIPELINE
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Evaluate Kolmoset with per-relay contexts on pre-built sample sets.
+fn arvioi_kolmoset_kierto(
+    kolmoset: &Kolmoset,
+    näytteet: [&[(Vec<f64>, char)]; 3],
+    hdc: &HdcPeruskäsitteet,
+    pcv: bool,
+) -> f64 {
+    if näytteet[0].is_empty() {
+        return 0.0;
+    }
+    let oikein = (0..näytteet[0].len())
+        .filter(|&i| {
+            let kontekstit = [
+                näytteet[0][i].0.as_slice(),
+                näytteet[1][i].0.as_slice(),
+                näytteet[2][i].0.as_slice(),
+            ];
+            let kohde = näytteet[0][i].1;
+            let (ennuste, _) = if pcv {
+                kolmoset.ennusta_kierto_pcv(kontekstit, hdc)
+            } else {
+                kolmoset.ennusta_kierto(kontekstit, hdc)
+            };
+            ennuste == kohde
+        })
+        .count();
+    oikein as f64 / näytteet[0].len() as f64
+}
+
+fn kouluta_kolmoset_kierto(
+    teksti: &str,
+    allekirjoitukset: &HashMap<char, ÄänneAllekirjoitus>,
+    koodikirja_oletus: &HashMap<char, Hypervektori>,
+    sitoja: &KontekstiSitoja,
+    hdc: &mut HdcPeruskäsitteet,
+    uudelleen: usize,
+    ulottuvuus: usize,
+    vaimennus: f64,
+    rotation_plane: Option<(usize, usize)>,
+    qams_specialize: bool,
+    pcv: bool,
+    no_dump: bool,
+) -> f64 {
+    // ── Build per-relay codebooks ─────────────────────────────────
+    println!("\n  [Kierto] Building per-relay codebooks...");
+
+    let mut kirjat: [HashMap<char, Hypervektori>; 3] = [
+        koodikirja_oletus.clone(),
+        koodikirja_oletus.clone(),
+        koodikirja_oletus.clone(),
+    ];
+
+    if qams_specialize {
+        // QAMS specialization: each relay emphasizes different phonetic dimensions
+        println!("    QAMS specialization: A=vowel, B=consonant, C=temporal");
+        kirjat[0] = luo_koodikirja_painotettu(allekirjoitukset, ulottuvuus, 42, &PAINOT_RELE_A);
+        kirjat[1] = luo_koodikirja_painotettu(allekirjoitukset, ulottuvuus, 42, &PAINOT_RELE_B);
+        kirjat[2] = luo_koodikirja_painotettu(allekirjoitukset, ulottuvuus, 42, &PAINOT_RELE_C);
+
+        // Add any characters from text that aren't in QAMS signatures
+        let mut rng = tahtiahjo_core::hdc_primitives::Siemen::new(777);
+        for c in teksti.chars() {
+            let c_lower = c.to_lowercase().next().unwrap_or(c);
+            for kirja in kirjat.iter_mut() {
+                kirja.entry(c_lower)
+                    .or_insert_with(|| rng.bipolaarinen_vektori(ulottuvuus));
+            }
+        }
+    }
+
+    if let Some((i, j)) = rotation_plane {
+        // Givens rotation: 120° spacing per relay (0°, 120°, 240°)
+        let theta_120 = 2.0 * std::f64::consts::PI / 3.0;
+        println!("    Givens rotation: plane=({},{}) at 0°/120°/240°", i, j);
+        // Relay A: 0° (identity — no rotation needed)
+        // Relay B: 120°
+        kirjat[1] = rotate_codebook(&kirjat[1], i, j, theta_120);
+        // Relay C: 240°
+        kirjat[2] = rotate_codebook(&kirjat[2], i, j, 2.0 * theta_120);
+    }
+
+    println!("    Codebook sizes: A={}, B={}, C={}",
+        kirjat[0].len(), kirjat[1].len(), kirjat[2].len());
+
+    // ── Build per-relay sample sets ──────────────────────────────
+    println!("  [Kierto] Building per-relay context vectors...");
+    let näytteet_a = rakenna_näytteet(teksti, &kirjat[0], sitoja, hdc);
+    let näytteet_b = rakenna_näytteet(teksti, &kirjat[1], sitoja, hdc);
+    let näytteet_c = rakenna_näytteet(teksti, &kirjat[2], sitoja, hdc);
+    println!("    Samples per relay: A={}, B={}, C={}",
+        näytteet_a.len(), näytteet_b.len(), näytteet_c.len());
+
+    // Extract alphabet (same across all relays — same text)
+    let mut aakkosto: Vec<char> = näytteet_a.iter().map(|(_, c)| *c).collect();
+    aakkosto.sort();
+    aakkosto.dedup();
+    println!("    Alphabet: {} characters", aakkosto.len());
+
+    // ── Create Kolmoset ─────────────────────────────────────────
+    let n = näytteet_a.len();
+    let askeleet_a = n / 5;
+    let askeleet_b = n / 10;
+    let askeleet_c = n / 5;
+    println!("    Relay legs: A={}, B={}, C={}", askeleet_a, askeleet_b, askeleet_c);
+    let mut kolmoset = Kolmoset::new_custom(
+        &aakkosto, ulottuvuus, askeleet_a, askeleet_b, askeleet_c,
+    );
+
+    if vaimennus > 0.0 {
+        kolmoset.aseta_vaimennus(vaimennus);
+        println!("    Damping: ψ={:.6}", vaimennus);
+    }
+
+    // ── Single-pass training with per-relay contexts ─────────────
+    let mut kaadot = 0usize;
+    if no_dump {
+        // Parallel independent training: all 3 relays see every sample
+        println!("\n  [Kierto] Training (parallel independent, no relay dumps)...");
+        for i in 0..n {
+            let kohde = näytteet_a[i].1;
+            // Train each relay on its own context — no relay cascade, no dumps
+            kolmoset.a.kouluta_askel(&näytteet_a[i].0, kohde, hdc);
+            kolmoset.b.kouluta_askel(&näytteet_b[i].0, kohde, hdc);
+            kolmoset.c.kouluta_askel(&näytteet_c[i].0, kohde, hdc);
+        }
+    } else {
+        println!("\n  [Kierto] Training (relay cascade with per-relay contexts)...");
+        for i in 0..n {
+            let kontekstit = [
+                näytteet_a[i].0.as_slice(),
+                näytteet_b[i].0.as_slice(),
+                näytteet_c[i].0.as_slice(),
+            ];
+            let kohde = näytteet_a[i].1;
+            let tulos = kolmoset.kouluta_askel_kierto(kontekstit, kohde, hdc);
+            if tulos.kaato.is_some() {
+                kaadot += 1;
+            }
+        }
+    }
+
+    let tila = kolmoset.tila();
+    let tarkkuus_alku = arvioi_kolmoset_kierto(
+        &kolmoset,
+        [&näytteet_a, &näytteet_b, &näytteet_c],
+        hdc, pcv,
+    );
+    println!("    Online accuracy:     {:.2}% (during training)", tila.tarkkuus * 100.0);
+    println!("    Ensemble accuracy:   {:.2}% (post-training{})", tarkkuus_alku * 100.0,
+        if pcv { ", PCV" } else { ", per-relay ctx" });
+    println!("    Memory dumps:        {} relay transitions", kaadot);
+    println!("    ─── Node Details ───");
+    println!("    A (Source):  acc={:.1}%  trust={:.3}  cycles={}  steps={}",
+        tila.a_tarkkuus * 100.0, tila.a_luottamus, tila.a_kierrokset, tila.a_askeleet);
+    println!("    B (Bridge):  acc={:.1}%  trust={:.3}  cycles={}  steps={}",
+        tila.b_tarkkuus * 100.0, tila.b_luottamus, tila.b_kierrokset, tila.b_askeleet);
+    println!("    C (Target):  acc={:.1}%  trust={:.3}  cycles={}  steps={}",
+        tila.c_tarkkuus * 100.0, tila.c_luottamus, tila.c_kierrokset, tila.c_askeleet);
+
+    // PCV diagnostic: relay agreement
+    if pcv {
+        let mid = n / 2; // sample from middle of data
+        let kontekstit = [
+            näytteet_a[mid].0.as_slice(),
+            näytteet_b[mid].0.as_slice(),
+            näytteet_c[mid].0.as_slice(),
+        ];
+        let (ab, bc, ac, avg) = kolmoset.pcv_diagnostiikka(kontekstit, hdc);
+        println!("    ─── PCV Agreement ───");
+        println!("    AB={:.3}  BC={:.3}  AC={:.3}  avg={:.3}", ab, bc, ac, avg);
+    }
+
+    // Also compare vs flat baseline (all relays use same default codebook)
+    let tarkkuus_flat = arvioi_kolmoset(&kolmoset, &näytteet_a, hdc);
+    println!("\n    Flat baseline (relay A ctx only): {:.2}%", tarkkuus_flat * 100.0);
+    println!("    Per-relay diversity Δ:           {:+.2}%",
+        (tarkkuus_alku - tarkkuus_flat) * 100.0);
+
+    // ── Retraining passes with per-relay samples ─────────────────
+    for kierros in 1..=uudelleen {
+        println!("\n  [Kierto] Retraining pass {}...", kierros);
+        let tarkkuus = if no_dump {
+            // Independent retrain: each relay retrains on its own samples, no dump cascade
+            let ta = kolmoset.a.uudelleenkouluta(&näytteet_a, hdc, kierros);
+            let tb = kolmoset.b.uudelleenkouluta(&näytteet_b, hdc, kierros);
+            let tc = kolmoset.c.uudelleenkouluta(&näytteet_c, hdc, kierros);
+            (ta + tb + tc) / 3.0
+        } else {
+            kolmoset.uudelleenkouluta_kierto(
+                [&näytteet_a, &näytteet_b, &näytteet_c],
+                hdc, kierros,
+            )
+        };
+        let tarkkuus_eval = arvioi_kolmoset_kierto(
+            &kolmoset,
+            [&näytteet_a, &näytteet_b, &näytteet_c],
+            hdc, pcv,
+        );
+        println!("    Retrain accuracy:   {:.2}%", tarkkuus * 100.0);
+        println!("    Ensemble accuracy:  {:.2}%", tarkkuus_eval * 100.0);
+    }
+
+    // ── PCV diagnostic after retraining ──────────────────────────
+    if pcv {
+        let mid = n / 2;
+        let kontekstit = [
+            näytteet_a[mid].0.as_slice(),
+            näytteet_b[mid].0.as_slice(),
+            näytteet_c[mid].0.as_slice(),
+        ];
+        let (ab, bc, ac, avg) = kolmoset.pcv_diagnostiikka(kontekstit, hdc);
+        println!("\n    ─── PCV Agreement (post-retrain) ───");
+        println!("    AB={:.3}  BC={:.3}  AC={:.3}  avg={:.3}", ab, bc, ac, avg);
+    }
+
+    // ── Final ─────────────────────────────────────────────────────
+    let loppu = arvioi_kolmoset_kierto(
+        &kolmoset,
+        [&näytteet_a, &näytteet_b, &näytteet_c],
+        hdc, pcv,
+    );
+    let loppu_flat = arvioi_kolmoset(&kolmoset, &näytteet_a, hdc);
+    let loppu_tila = kolmoset.tila();
+    println!("\n  [Kierto] Final state:");
+    println!("    A trust={:.3}  B trust={:.3}  C trust={:.3}",
+        loppu_tila.a_luottamus, loppu_tila.b_luottamus, loppu_tila.c_luottamus);
+    println!("    Per-relay accuracy: {:.2}%{}", loppu * 100.0,
+        if pcv { " (PCV)" } else { "" });
+    println!("    Flat baseline:     {:.2}%", loppu_flat * 100.0);
+    println!("    Diversity Δ:       {:+.2}%", (loppu - loppu_flat) * 100.0);
 
     loppu
 }
@@ -553,6 +862,7 @@ fn kouluta_kolmoset_keskus(
     uudelleen: usize,
     alpha_overrides: (Option<f64>, Option<f64>, Option<f64>, Option<f64>),
     ulottuvuus: usize,
+    vaimennus: f64,
 ) -> f64 {
     // Build all (context, target) samples
     println!("\n  [Kolmoset+Keskus] Building context vectors...");
@@ -574,6 +884,12 @@ fn kouluta_kolmoset_keskus(
     let mut kolmoset = Kolmoset::new_custom(
         &aakkosto, ulottuvuus, askeleet_a, askeleet_b, askeleet_c,
     );
+
+    // Apply golden-mean damping if requested
+    if vaimennus > 0.0 {
+        kolmoset.aseta_vaimennus(vaimennus);
+        println!("    Damping: ψ={:.6}", vaimennus);
+    }
 
     // ── Create Keskus ───────────────────────────────────────────────
     let mut keskus = Keskus::new(&aakkosto, koodikirja.clone(), ulottuvuus);
@@ -766,6 +1082,7 @@ fn kouluta_kolmoset_keskus_kaksoisnapainen(
     alpha_overrides: (Option<f64>, Option<f64>, Option<f64>, Option<f64>),
     bipyramid_kynnys: f64,
     ulottuvuus: usize,
+    vaimennus: f64,
 ) -> f64 {
     // Build all (context, target) samples
     println!("\n  [Kolmoset+Keskus+Bipyramid] Building context vectors...");
@@ -792,6 +1109,12 @@ fn kouluta_kolmoset_keskus_kaksoisnapainen(
     let mut kolmoset = Kolmoset::new_custom(
         &aakkosto, ulottuvuus, askeleet_a, askeleet_b, askeleet_c,
     );
+
+    // Apply golden-mean damping if requested
+    if vaimennus > 0.0 {
+        kolmoset.aseta_vaimennus(vaimennus);
+        println!("    Damping: ψ={:.6}", vaimennus);
+    }
 
     // ── Create Keskus ───────────────────────────────────────────────
     let mut keskus = Keskus::new(&aakkosto, koodikirja.clone(), ulottuvuus);

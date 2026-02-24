@@ -275,6 +275,74 @@ fn muisti_kaato(
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// PHASE CONJUGATE VOTING — φ-weighted agreement ensemble
+// ═══════════════════════════════════════════════════════════════════
+//
+// When two relays agree and one disagrees:
+//   Agreeing pair: weight ≈ φ each → ~84% of effective vote
+//   Outlier:       weight ≈ 1/φ   → ~16% of effective vote
+//   vs uniform:    33% each       → 66% for correct pair
+//
+// When all three agree: normalizes back to ~1/3 each (no harm).
+
+/// Cosine similarity between two relay score vectors.
+fn score_cosine_sim(a: &[f64], b: &[f64]) -> f64 {
+    let mut dot = 0.0;
+    let mut norm_a = 0.0;
+    let mut norm_b = 0.0;
+    for i in 0..a.len() {
+        dot += a[i] * b[i];
+        norm_a += a[i] * a[i];
+        norm_b += b[i] * b[i];
+    }
+    let denom = (norm_a * norm_b).sqrt();
+    if denom < 1e-12 { 0.0 } else { dot / denom }
+}
+
+/// Map coherence [-1, 1] → weight [1/φ, φ] smoothly through 1.0.
+fn phase_conjugate_weight(coherence: f64) -> f64 {
+    if coherence > 0.0 {
+        1.0 + (PHI - 1.0) * coherence          // 1.0 → φ
+    } else {
+        1.0 + (1.0 - TAU) * coherence           // 1.0 → 1/φ
+    }
+}
+
+/// Phase conjugate ensemble vote. Drop-in replacement for uniform averaging.
+pub fn ennusta_phase_conjugate(
+    scores_a: &[f64],
+    scores_b: &[f64],
+    scores_c: &[f64],
+) -> Vec<f64> {
+    let n = scores_a.len();
+
+    // Pairwise agreement
+    let agree_ab = score_cosine_sim(scores_a, scores_b);
+    let agree_bc = score_cosine_sim(scores_b, scores_c);
+    let agree_ac = score_cosine_sim(scores_a, scores_c);
+
+    // Per-relay coherence = average agreement with the other two
+    let coh_a = (agree_ab + agree_ac) / 2.0;
+    let coh_b = (agree_ab + agree_bc) / 2.0;
+    let coh_c = (agree_ac + agree_bc) / 2.0;
+
+    // Phi-weighted
+    let w_a = phase_conjugate_weight(coh_a);
+    let w_b = phase_conjugate_weight(coh_b);
+    let w_c = phase_conjugate_weight(coh_c);
+    let w_total = w_a + w_b + w_c;
+
+    // Weighted vote
+    let mut out = vec![0.0; n];
+    for i in 0..n {
+        out[i] = (w_a * scores_a[i]
+                + w_b * scores_b[i]
+                + w_c * scores_c[i]) / w_total;
+    }
+    out
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // TRIPLE RELAY — Kolmoset
 // ═══════════════════════════════════════════════════════════════════
 
@@ -502,6 +570,278 @@ impl Kolmoset {
         }
     }
 
+    // ═══════════════════════════════════════════════════════════════
+    // KIERTO (rotation) — Per-relay context dispatch
+    // ═══════════════════════════════════════════════════════════════
+    //
+    // Each relay gets its own context vector (built from a rotated
+    // or specialized codebook). The relay still trains on the same
+    // target character, but sees the context through its own lens.
+
+    /// Train one step with per-relay context vectors.
+    ///
+    /// Each relay node receives its own context (from its own codebook).
+    /// Only the active node trains, but all three contexts must be provided
+    /// because the active node changes via relay transitions.
+    pub fn kouluta_askel_kierto(
+        &mut self,
+        kontekstit: [&[f64]; 3],  // [relay_a_ctx, relay_b_ctx, relay_c_ctx]
+        kohde: char,
+        hdc: &HdcPeruskäsitteet,
+    ) -> KolmosetTulos {
+        self.askel += 1;
+        self.yhteensä += 1;
+
+        // Train on active node with its own context
+        let (ennuste, oikein) = match self.aktiivinen {
+            0 => self.a.kouluta_askel(kontekstit[0], kohde, hdc),
+            1 => self.b.kouluta_askel(kontekstit[1], kohde, hdc),
+            _ => self.c.kouluta_askel(kontekstit[2], kohde, hdc),
+        };
+
+        if oikein {
+            self.oikein += 1;
+        }
+
+        // Check for relay transition (same logic as kouluta_askel)
+        let kaato = match self.aktiivinen {
+            0 if self.a.valmis() => {
+                muisti_kaato(&self.a, &mut self.b);
+                self.a.nollaa_kierros();
+                self.aktiivinen = 1;
+                Some("A → B")
+            }
+            1 if self.b.valmis() => {
+                muisti_kaato(&self.b, &mut self.c);
+                self.b.nollaa_kierros();
+                self.aktiivinen = 2;
+                Some("B → C")
+            }
+            2 if self.c.valmis() => {
+                muisti_kaato(&self.c, &mut self.a);
+                self.c.nollaa_kierros();
+                self.aktiivinen = 0;
+                Some("C → A (cycle)")
+            }
+            _ => None,
+        };
+
+        KolmosetTulos {
+            ennuste,
+            kohde,
+            oikein,
+            aktiivinen_nimi: self.aktiivinen_nimi(),
+            kaato,
+        }
+    }
+
+    /// Ensemble prediction with per-relay contexts.
+    ///
+    /// Each relay scores using its own context vector.
+    pub fn ennusta_kierto(
+        &self,
+        kontekstit: [&[f64]; 3],
+        hdc: &HdcPeruskäsitteet,
+    ) -> (char, f64) {
+        let paino_a = self.a.luottamus();
+        let paino_b = self.b.luottamus();
+        let paino_c = self.c.luottamus();
+        let summa = paino_a + paino_b + paino_c;
+
+        if summa < 1e-12 {
+            return match self.aktiivinen {
+                0 => self.a.ennusta(kontekstit[0], hdc),
+                1 => self.b.ennusta(kontekstit[1], hdc),
+                _ => self.c.ennusta(kontekstit[2], hdc),
+            };
+        }
+
+        let mut paras_merkki = ' ';
+        let mut paras_piste = f64::NEG_INFINITY;
+
+        for &c in &self.aakkosto {
+            let sa = self.a.pisteet(kontekstit[0], c, hdc);
+            let sb = self.b.pisteet(kontekstit[1], c, hdc);
+            let sc = self.c.pisteet(kontekstit[2], c, hdc);
+
+            let piste = (paino_a * sa + paino_b * sb + paino_c * sc) / summa;
+
+            if piste > paras_piste {
+                paras_piste = piste;
+                paras_merkki = c;
+            }
+        }
+
+        (paras_merkki, paras_piste)
+    }
+
+    /// All scores with per-relay contexts.
+    pub fn kaikki_pisteet_kierto(
+        &self,
+        kontekstit: [&[f64]; 3],
+        hdc: &HdcPeruskäsitteet,
+    ) -> std::collections::HashMap<char, f64> {
+        let paino_a = self.a.luottamus();
+        let paino_b = self.b.luottamus();
+        let paino_c = self.c.luottamus();
+        let summa = paino_a + paino_b + paino_c;
+
+        let mut pisteet = std::collections::HashMap::new();
+        for &c in &self.aakkosto {
+            let piste = if summa < 1e-12 {
+                match self.aktiivinen {
+                    0 => self.a.pisteet(kontekstit[0], c, hdc),
+                    1 => self.b.pisteet(kontekstit[1], c, hdc),
+                    _ => self.c.pisteet(kontekstit[2], c, hdc),
+                }
+            } else {
+                let sa = self.a.pisteet(kontekstit[0], c, hdc);
+                let sb = self.b.pisteet(kontekstit[1], c, hdc);
+                let sc = self.c.pisteet(kontekstit[2], c, hdc);
+                (paino_a * sa + paino_b * sb + paino_c * sc) / summa
+            };
+            pisteet.insert(c, piste);
+        }
+        pisteet
+    }
+
+    /// Retrain with per-relay sample sets.
+    ///
+    /// Each relay retrains on its own (context, target) pairs built
+    /// from its specialized codebook. Knowledge still transfers
+    /// via the relay dump cascade (A→B→C→A).
+    pub fn uudelleenkouluta_kierto(
+        &mut self,
+        näytteet: [&[(Vec<f64>, char)]; 3],
+        hdc: &HdcPeruskäsitteet,
+        kierros: usize,
+    ) -> f64 {
+        // A retrains on its own samples
+        let ta = self.a.uudelleenkouluta(näytteet[0], hdc, kierros);
+        muisti_kaato(&self.a, &mut self.b);
+
+        // B retrains on its own samples
+        let tb = self.b.uudelleenkouluta(näytteet[1], hdc, kierros);
+        muisti_kaato(&self.b, &mut self.c);
+
+        // C retrains on its own samples
+        let tc = self.c.uudelleenkouluta(näytteet[2], hdc, kierros);
+        muisti_kaato(&self.c, &mut self.a);
+
+        // Return weighted average
+        let pa = self.a.luottamus();
+        let pb = self.b.luottamus();
+        let pc = self.c.luottamus();
+        let s = pa + pb + pc;
+        if s > 0.0 {
+            (pa * ta + pb * tb + pc * tc) / s
+        } else {
+            (ta + tb + tc) / 3.0
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // PHASE CONJUGATE VOTING — Per-relay kierto + φ-weighted agreement
+    // ═══════════════════════════════════════════════════════════════
+
+    /// Ensemble prediction with per-relay contexts using Phase Conjugate Voting.
+    ///
+    /// Instead of trust-weighted averaging, PCV weights relays by their
+    /// agreement with the consensus. Agreeing relays get weight φ,
+    /// outliers get weight 1/φ.
+    pub fn ennusta_kierto_pcv(
+        &self,
+        kontekstit: [&[f64]; 3],
+        hdc: &HdcPeruskäsitteet,
+    ) -> (char, f64) {
+        let n = self.aakkosto.len();
+        let mut scores_a = vec![0.0; n];
+        let mut scores_b = vec![0.0; n];
+        let mut scores_c = vec![0.0; n];
+
+        for (idx, &c) in self.aakkosto.iter().enumerate() {
+            scores_a[idx] = self.a.pisteet(kontekstit[0], c, hdc);
+            scores_b[idx] = self.b.pisteet(kontekstit[1], c, hdc);
+            scores_c[idx] = self.c.pisteet(kontekstit[2], c, hdc);
+        }
+
+        let combined = ennusta_phase_conjugate(&scores_a, &scores_b, &scores_c);
+
+        let mut paras_merkki = ' ';
+        let mut paras_piste = f64::NEG_INFINITY;
+        for (idx, &c) in self.aakkosto.iter().enumerate() {
+            if combined[idx] > paras_piste {
+                paras_piste = combined[idx];
+                paras_merkki = c;
+            }
+        }
+
+        (paras_merkki, paras_piste)
+    }
+
+    /// All scores with per-relay contexts using Phase Conjugate Voting.
+    pub fn kaikki_pisteet_kierto_pcv(
+        &self,
+        kontekstit: [&[f64]; 3],
+        hdc: &HdcPeruskäsitteet,
+    ) -> std::collections::HashMap<char, f64> {
+        let n = self.aakkosto.len();
+        let mut scores_a = vec![0.0; n];
+        let mut scores_b = vec![0.0; n];
+        let mut scores_c = vec![0.0; n];
+
+        for (idx, &c) in self.aakkosto.iter().enumerate() {
+            scores_a[idx] = self.a.pisteet(kontekstit[0], c, hdc);
+            scores_b[idx] = self.b.pisteet(kontekstit[1], c, hdc);
+            scores_c[idx] = self.c.pisteet(kontekstit[2], c, hdc);
+        }
+
+        let combined = ennusta_phase_conjugate(&scores_a, &scores_b, &scores_c);
+
+        let mut pisteet = std::collections::HashMap::new();
+        for (idx, &c) in self.aakkosto.iter().enumerate() {
+            pisteet.insert(c, combined[idx]);
+        }
+        pisteet
+    }
+
+    /// Compute relay agreement diagnostics for PCV.
+    /// Returns (agree_ab, agree_bc, agree_ac, avg_agreement).
+    pub fn pcv_diagnostiikka(
+        &self,
+        kontekstit: [&[f64]; 3],
+        hdc: &HdcPeruskäsitteet,
+    ) -> (f64, f64, f64, f64) {
+        let n = self.aakkosto.len();
+        let mut scores_a = vec![0.0; n];
+        let mut scores_b = vec![0.0; n];
+        let mut scores_c = vec![0.0; n];
+
+        for (idx, &c) in self.aakkosto.iter().enumerate() {
+            scores_a[idx] = self.a.pisteet(kontekstit[0], c, hdc);
+            scores_b[idx] = self.b.pisteet(kontekstit[1], c, hdc);
+            scores_c[idx] = self.c.pisteet(kontekstit[2], c, hdc);
+        }
+
+        let agree_ab = score_cosine_sim(&scores_a, &scores_b);
+        let agree_bc = score_cosine_sim(&scores_b, &scores_c);
+        let agree_ac = score_cosine_sim(&scores_a, &scores_c);
+        let avg = (agree_ab + agree_bc + agree_ac) / 3.0;
+
+        (agree_ab, agree_bc, agree_ac, avg)
+    }
+
+    /// Set golden-mean damping on all 6 accumulators (3 nodes × myöntö + kielto).
+    /// ψ = 0.0 disables damping. Recommended: ψ = Γ ≈ 0.103.
+    pub fn aseta_vaimennus(&mut self, psi: f64) {
+        self.a.myöntö.vaimennus = psi;
+        self.a.kielto.vaimennus = psi;
+        self.b.myöntö.vaimennus = psi;
+        self.b.kielto.vaimennus = psi;
+        self.c.myöntö.vaimennus = psi;
+        self.c.kielto.vaimennus = psi;
+    }
+
     /// Current accuracy.
     pub fn tarkkuus(&self) -> f64 {
         if self.yhteensä == 0 { 0.0 }
@@ -697,5 +1037,60 @@ mod tests {
         assert_eq!(kolmoset.a.max_askeleet, 100);
         assert_eq!(kolmoset.b.max_askeleet, 50);
         assert_eq!(kolmoset.c.max_askeleet, 200);
+    }
+
+    #[test]
+    fn test_kierto_relay_transitions() {
+        let mut hdc = luo_hdc();
+        let aakkosto = testi_aakkosto();
+        let mut kolmoset = Kolmoset::new_custom(&aakkosto, ULOTTUVUUS, 5, 3, 5);
+
+        let ctx_a = hdc.satunnainen_bipolaarinen();
+        let ctx_b = hdc.satunnainen_bipolaarinen();
+        let ctx_c = hdc.satunnainen_bipolaarinen();
+        let mut kaadot = Vec::new();
+
+        for _ in 0..15 {
+            let tulos = kolmoset.kouluta_askel_kierto(
+                [&ctx_a, &ctx_b, &ctx_c], 'a', &hdc,
+            );
+            if let Some(k) = tulos.kaato {
+                kaadot.push(k.to_string());
+            }
+        }
+
+        assert!(kaadot.len() >= 2,
+            "kierto should have relay dumps: {:?}", kaadot);
+        assert_eq!(kaadot[0], "A → B");
+        assert_eq!(kaadot[1], "B → C");
+    }
+
+    #[test]
+    fn test_kierto_ensemble_prediction() {
+        let hdc = luo_hdc();
+        let aakkosto = testi_aakkosto();
+        let mut kolmoset = Kolmoset::new(&aakkosto, ULOTTUVUUS);
+
+        let ctx = vec![1.0; ULOTTUVUUS];
+        for _ in 0..50 {
+            kolmoset.a.myöntö.kerrytä('a', &ctx, 1.0);
+        }
+
+        // Per-relay predict should find 'a' with same context on all relays
+        let (ennuste, _) = kolmoset.ennusta_kierto([&ctx, &ctx, &ctx], &hdc);
+        assert_eq!(ennuste, 'a',
+            "kierto ensemble should predict 'a' when A strongly signals it");
+    }
+
+    #[test]
+    fn test_kierto_all_scores() {
+        let hdc = luo_hdc();
+        let aakkosto = testi_aakkosto();
+        let kolmoset = Kolmoset::new(&aakkosto, ULOTTUVUUS);
+
+        let ctx = vec![0.0; ULOTTUVUUS];
+        let pisteet = kolmoset.kaikki_pisteet_kierto([&ctx, &ctx, &ctx], &hdc);
+        assert_eq!(pisteet.len(), aakkosto.len(),
+            "should have scores for all alphabet characters");
     }
 }

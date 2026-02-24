@@ -247,6 +247,79 @@ pub fn luo_koodikirja(
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// WEIGHTED CODEBOOK — Per-parameter emphasis for relay specialization
+// ═══════════════════════════════════════════════════════════════════
+
+/// Relay specialization preset profiles.
+/// Each relay emphasizes different phonetic dimensions to break convergence.
+pub const PAINOT_RELE_A: [f64; 6] = [3.0, 0.5, 3.0, 0.5, 0.5, 0.5]; // vowel: aperture + voicing
+pub const PAINOT_RELE_B: [f64; 6] = [0.5, 0.5, 0.5, 3.0, 3.0, 0.5]; // consonant: place + manner
+pub const PAINOT_RELE_C: [f64; 6] = [0.5, 3.0, 0.5, 0.5, 0.5, 3.0]; // temporal: duration + freq
+
+/// Build codebook with per-parameter weights.
+///
+/// painot[i] scales block i's contribution:
+///   1.0 = normal, 3.0 = emphasized, 0.0 = zeroed.
+///
+/// Block structure (D/6 dims each):
+///   0: aukko (aperture), 1: kesto (duration), 2: ääntö (voicing),
+///   3: paikka (place), 4: tapa (manner), 5: taajuus (frequency)
+pub fn luo_koodikirja_painotettu(
+    taulukko: &HashMap<char, ÄänneAllekirjoitus>,
+    ulottuvuus: usize,
+    siemen: u64,
+    painot: &[f64; 6],
+) -> HashMap<char, Hypervektori> {
+    let mut rng = Siemen::new(siemen);
+    let lohko = ulottuvuus / PARAMETRIT;
+
+    let perus: Vec<Hypervektori> = (0..PARAMETRIT)
+        .map(|_| rng.bipolaarinen_vektori(lohko))
+        .collect();
+
+    let risti: Vec<Hypervektori> = (0..PARAMETRIT - 1)
+        .map(|_| rng.bipolaarinen_vektori(ulottuvuus))
+        .collect();
+
+    let mut kirja: HashMap<char, Hypervektori> = HashMap::new();
+
+    for (&merkki, alle) in taulukko.iter() {
+        let p = alle.as_array();
+        let mut v = vec![0.0f64; ulottuvuus];
+
+        // Block-diagonal with per-block weights
+        for i in 0..PARAMETRIT {
+            let alku = i * lohko;
+            let paino = painot[i];
+            for j in 0..lohko {
+                if alku + j < ulottuvuus {
+                    v[alku + j] += paino * p[i] * perus[i][j];
+                }
+            }
+        }
+        // Cross-terms (weighted by geometric mean of adjacent block weights)
+        for i in 0..PARAMETRIT - 1 {
+            let w = (p[i] * p[i + 1]).abs();
+            let cross_weight = (painot[i] * painot[i + 1]).sqrt();
+            for j in 0..ulottuvuus {
+                v[j] += w * risti[i][j] * 0.1 * cross_weight;
+            }
+        }
+        // Disambiguation noise (same as unweighted — deterministic per char)
+        let seed = (merkki as u64).wrapping_mul(2654435761);
+        let mut crng = Siemen::new(seed);
+        for j in 0..ulottuvuus {
+            v[j] += crng.bipolaarinen() * 0.2;
+        }
+        // Bipolarize
+        kirja.insert(merkki,
+            v.iter().map(|&x| if x >= 0.0 { 1.0 } else { -1.0 }).collect()
+        );
+    }
+    kirja
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // FULL PHONETIC SIGNATURE TABLE
 // ═══════════════════════════════════════════════════════════════════
 //
@@ -412,5 +485,46 @@ mod tests {
             assert!(v.iter().all(|&x| x == 1.0 || x == -1.0),
                 "all values must be bipolar");
         }
+    }
+
+    #[test]
+    fn test_weighted_codebook_generation() {
+        let t = test_signatures();
+        let painot = [3.0, 0.5, 3.0, 0.5, 0.5, 0.5]; // relay A preset
+        let kirja = luo_koodikirja_painotettu(&t, ULOTTUVUUS, 42, &painot);
+        assert_eq!(kirja.len(), t.len());
+        for v in kirja.values() {
+            assert_eq!(v.len(), ULOTTUVUUS);
+            assert!(v.iter().all(|&x| x == 1.0 || x == -1.0),
+                "weighted codebook values must be bipolar");
+        }
+    }
+
+    #[test]
+    fn test_weighted_codebook_differs_from_uniform() {
+        let t = test_signatures();
+        let uniform = luo_koodikirja(&t, ULOTTUVUUS, 42);
+        let weighted = luo_koodikirja_painotettu(&t, ULOTTUVUUS, 42, &PAINOT_RELE_A);
+        // Some characters should differ between uniform and weighted
+        let mut differ = 0;
+        for &c in uniform.keys() {
+            if uniform[&c] != weighted[&c] {
+                differ += 1;
+            }
+        }
+        assert!(differ > 0,
+            "weighted codebook should differ from uniform for at least some chars");
+    }
+
+    #[test]
+    fn test_relay_presets_are_diverse() {
+        let t = test_signatures();
+        let ka = luo_koodikirja_painotettu(&t, ULOTTUVUUS, 42, &PAINOT_RELE_A);
+        let kb = luo_koodikirja_painotettu(&t, ULOTTUVUUS, 42, &PAINOT_RELE_B);
+        let kc = luo_koodikirja_painotettu(&t, ULOTTUVUUS, 42, &PAINOT_RELE_C);
+        // All three should produce different codebooks for vowel 'a'
+        assert_ne!(ka[&'a'], kb[&'a'], "relay A and B should differ for 'a'");
+        assert_ne!(kb[&'a'], kc[&'a'], "relay B and C should differ for 'a'");
+        assert_ne!(ka[&'a'], kc[&'a'], "relay A and C should differ for 'a'");
     }
 }
