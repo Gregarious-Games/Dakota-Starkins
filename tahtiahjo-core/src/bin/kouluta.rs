@@ -39,6 +39,7 @@ use tahtiahjo_core::kaksoset::Kaksoset;
 use tahtiahjo_core::kolmoset::Kolmoset;
 use tahtiahjo_core::keskus::Keskus;
 use tahtiahjo_core::kaksoisnapainen::KaksoisnapainenKartta;
+use tahtiahjo_core::phase_harmonic::PhaseHarmonizer;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -85,6 +86,12 @@ fn main() {
 
     // No relay dump (parallel independent training)
     let mut no_dump = false;
+
+    // Phase Harmonic Engine
+    let mut käytä_phase_harmonic = false;
+    let mut käytä_harmonic_hybrid = false;
+    let mut käytä_harmonic_compare = false;
+    let mut käytä_d18 = false;
 
     for arg in &args[2..] {
         if let Some(val) = arg.strip_prefix("--chars=") {
@@ -136,6 +143,14 @@ fn main() {
             käytä_pcv = true;
         } else if arg == "--no-dump" {
             no_dump = true;
+        } else if arg == "--phase-harmonic" {
+            käytä_phase_harmonic = true;
+        } else if arg == "--harmonic-hybrid" {
+            käytä_harmonic_hybrid = true;
+        } else if arg == "--harmonic-compare" {
+            käytä_harmonic_compare = true;
+        } else if arg == "--d18" {
+            käytä_d18 = true;
         }
     }
 
@@ -161,6 +176,21 @@ fn main() {
     }
     if vertaa {
         println!("  Mode:       COMPARE (all architectures)");
+    } else if käytä_kolmoset && käytä_harmonic_compare {
+        println!("  Mode:       KOLMOSET + HARMONIC COMPARE (4-way: raw/keskus/harmonic/hybrid)");
+        if käytä_d18 {
+            println!("  Harmonic:   D-18 mode (9 conjugate pairs)");
+        }
+    } else if käytä_kolmoset && käytä_harmonic_hybrid {
+        println!("  Mode:       KOLMOSET + PHASE HARMONIC + KESKUS (hybrid)");
+        if käytä_d18 {
+            println!("  Harmonic:   D-18 mode (9 conjugate pairs)");
+        }
+    } else if käytä_kolmoset && käytä_phase_harmonic {
+        println!("  Mode:       KOLMOSET + PHASE HARMONIC (pure phase-lock)");
+        if käytä_d18 {
+            println!("  Harmonic:   D-18 mode (9 conjugate pairs)");
+        }
     } else if käytä_kolmoset && (käytä_rotation || käytä_qams_specialize || käytä_pcv || no_dump) {
         let mut mode_parts = vec!["KOLMOSET"];
         if käytä_rotation { mode_parts.push("ROTATION"); }
@@ -237,6 +267,35 @@ fn main() {
             println!("  >>> LuokkaKertymä wins");
         }
         println!("═══════════════════════════════════════════════════════════════");
+    } else if käytä_kolmoset && käytä_harmonic_compare {
+        // ═══════════════════════════════════════════════════════════════
+        // KOLMOSET + HARMONIC COMPARE (4-way: raw/keskus/harmonic/hybrid)
+        // ═══════════════════════════════════════════════════════════════
+        let alpha_overrides = (alpha_siirtyma, alpha_taajuus, alpha_kierto, alpha_sana);
+        let tarkkuus = kouluta_kolmoset_harmonic_compare(
+            &teksti, &koodikirja, &sitoja, &mut hdc, uudelleen,
+            alpha_overrides, ulottuvuus, vaimennus, käytä_d18,
+        );
+        tulosta_lopputulos(tarkkuus);
+    } else if käytä_kolmoset && käytä_harmonic_hybrid {
+        // ═══════════════════════════════════════════════════════════════
+        // KOLMOSET + PHASE HARMONIC + KESKUS HYBRID
+        // ═══════════════════════════════════════════════════════════════
+        let alpha_overrides = (alpha_siirtyma, alpha_taajuus, alpha_kierto, alpha_sana);
+        let tarkkuus = kouluta_kolmoset_harmonic(
+            &teksti, &koodikirja, &sitoja, &mut hdc, uudelleen,
+            alpha_overrides, ulottuvuus, vaimennus, käytä_d18, true,
+        );
+        tulosta_lopputulos(tarkkuus);
+    } else if käytä_kolmoset && käytä_phase_harmonic {
+        // ═══════════════════════════════════════════════════════════════
+        // KOLMOSET + PURE PHASE HARMONIC
+        // ═══════════════════════════════════════════════════════════════
+        let tarkkuus = kouluta_kolmoset_harmonic(
+            &teksti, &koodikirja, &sitoja, &mut hdc, uudelleen,
+            (None, None, None, None), ulottuvuus, vaimennus, käytä_d18, false,
+        );
+        tulosta_lopputulos(tarkkuus);
     } else if käytä_kolmoset && (käytä_rotation || käytä_qams_specialize || käytä_pcv || no_dump) {
         // ═══════════════════════════════════════════════════════════════
         // KOLMOSET + ROTATION / QAMS SPECIALIZATION / PCV MODE
@@ -1256,6 +1315,512 @@ fn kouluta_kolmoset_keskus_kaksoisnapainen(
         keskus_tila.stressitaso, keskus_tila.ikkuna_tarkkuus * 100.0, keskus_tila.kierto_normi);
 
     loppu_bp
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// KOLMOSET + PHASE HARMONIC ENGINE PIPELINE
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Evaluate Kolmoset+PhaseHarmonizer: get per-relay scores, feed to harmonizer.
+/// Sequential because PhaseHarmonizer has breathing state.
+fn arvioi_kolmoset_harmonic(
+    kolmoset: &Kolmoset,
+    harmonizer: &mut PhaseHarmonizer,
+    näytteet: &[(Vec<f64>, char)],
+    hdc: &HdcPeruskäsitteet,
+    aakkosto: &[char],
+) -> f64 {
+    if näytteet.is_empty() {
+        return 0.0;
+    }
+    let mut oikein = 0usize;
+
+    // Build char-to-index map
+    let char_to_idx: HashMap<char, usize> = aakkosto.iter()
+        .enumerate()
+        .map(|(i, &c)| (c, i))
+        .collect();
+
+    for (konteksti, kohde) in näytteet {
+        // 1. Get per-relay score vectors
+        let relay_scores = kolmoset.per_relay_pisteet(konteksti, hdc);
+
+        // 2. Feed to PhaseHarmonizer (one Vec<f64> per dial)
+        let model_scores: Vec<Vec<f64>> = relay_scores.to_vec();
+        let (pred_idx, _confidence, _alignment) = harmonizer.predict(&model_scores, None);
+
+        // 3. Map index back to character
+        let ennuste = if pred_idx < aakkosto.len() {
+            aakkosto[pred_idx]
+        } else {
+            ' '
+        };
+
+        if ennuste == *kohde {
+            oikein += 1;
+        }
+
+        // 4. Record result for dial self-tuning
+        let actual_idx = char_to_idx.get(kohde).copied().unwrap_or(0);
+        harmonizer.record_result(&model_scores, actual_idx);
+    }
+
+    oikein as f64 / näytteet.len() as f64
+}
+
+/// Evaluate Kolmoset+PhaseHarmonizer+Keskus hybrid:
+/// 1. Keskus enriches context → per-relay scores → PhaseHarmonizer combines
+/// 2. Reconstruct combined scores → Keskus applies transition/frequency priors
+/// 3. Argmax on final scores
+fn arvioi_kolmoset_harmonic_hybrid(
+    kolmoset: &Kolmoset,
+    harmonizer: &mut PhaseHarmonizer,
+    keskus: &mut Keskus,
+    näytteet: &[(Vec<f64>, char)],
+    hdc: &HdcPeruskäsitteet,
+    aakkosto: &[char],
+) -> f64 {
+    if näytteet.is_empty() {
+        return 0.0;
+    }
+    let mut oikein = 0usize;
+
+    let char_to_idx: HashMap<char, usize> = aakkosto.iter()
+        .enumerate()
+        .map(|(i, &c)| (c, i))
+        .collect();
+    let n = aakkosto.len();
+
+    for (konteksti, kohde) in näytteet {
+        // 1. Enrich context with Keskus recurrent state
+        let rikastettu = keskus.rikasta(konteksti);
+
+        // 2. Get per-relay scores on enriched context
+        let relay_scores = kolmoset.per_relay_pisteet(&rikastettu, hdc);
+
+        // 3. PhaseHarmonizer processes relay scores (phase-lock, breathing)
+        let model_scores: Vec<Vec<f64>> = relay_scores.to_vec();
+        let (_pred_idx, _confidence, _alignment) = harmonizer.predict(&model_scores, None);
+
+        // 4. Reconstruct combined score vector from harmonizer's weighted dials
+        let mut combined = vec![0.0; n];
+        let mut weight_sum = 0.0;
+        for dial in &harmonizer.dials {
+            if dial.last_scores.len() == n {
+                for j in 0..n {
+                    combined[j] += dial.last_scores[j] * dial.weight;
+                }
+                weight_sum += dial.weight;
+            }
+        }
+        if weight_sum > 1e-12 {
+            for j in 0..n {
+                combined[j] /= weight_sum;
+            }
+        }
+
+        // 5. Apply Keskus transition+frequency priors to combined scores
+        let säädetyt = keskus.sovella_pistevektori(&combined);
+
+        // 6. Argmax on final adjusted scores
+        let (final_idx, _) = säädetyt.iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
+            .unwrap_or((0, &0.0));
+
+        let ennuste = if final_idx < n {
+            aakkosto[final_idx]
+        } else {
+            ' '
+        };
+
+        if ennuste == *kohde {
+            oikein += 1;
+        }
+
+        // 7. Update state for both systems
+        let actual_idx = char_to_idx.get(kohde).copied().unwrap_or(0);
+        harmonizer.record_result(&model_scores, actual_idx);
+        let luottamus = säädetyt.get(final_idx).copied().unwrap_or(0.0).abs().min(1.0);
+        keskus.päivitä(ennuste, *kohde, konteksti, luottamus, hdc);
+    }
+
+    oikein as f64 / näytteet.len() as f64
+}
+
+/// Print PhaseHarmonizer diagnostics.
+fn tulosta_harmonic_diagnostiikka(harmonizer: &PhaseHarmonizer) {
+    let diag = harmonizer.diagnostics();
+    println!("    ─── Phase Harmonic Diagnostics ───");
+    println!("    Dials: {}  Coherence: {:.4} (φ={:.3} √3={:.3})",
+        diag.num_dials, diag.coherence, diag.motion_coherence, diag.structural_coherence);
+    println!("    Predictions: {}  Alignments: {:.1}%  Constructive: {:.1}%",
+        diag.total_predictions,
+        diag.alignment_rate * 100.0,
+        diag.constructive_rate * 100.0);
+    println!("    Breath: [{},{},{},{}]  Tolerance: {:.3}rad",
+        diag.breath_durations[0], diag.breath_durations[1],
+        diag.breath_durations[2], diag.breath_durations[3],
+        diag.phase_tolerance);
+    for ds in &diag.dial_states {
+        println!("      [{}] δ={} T={:.2} w={:.3} acc={:.3} {}{}",
+            ds.name, ds.delta, ds.temperature, ds.weight, ds.recent_accuracy,
+            if ds.in_phi_mode { "φ" } else { "√3" },
+            if ds.has_conjugate { " ⇄" } else { "" });
+    }
+}
+
+/// Create a PhaseHarmonizer configured for the given alphabet.
+fn luo_harmonizer(num_chars: usize, ulottuvuus: usize, d18: bool) -> PhaseHarmonizer {
+    if d18 {
+        println!("  [PhaseHarmonic] D-18 mode: 9 conjugate pairs, 18 dials");
+        PhaseHarmonizer::new_d18(num_chars, ulottuvuus)
+    } else {
+        println!("  [PhaseHarmonic] 3-dial mode: Coarse(12) / Medium(37) / Fine(200)");
+        PhaseHarmonizer::new(num_chars, ulottuvuus)
+    }
+}
+
+/// KOLMOSET + PHASE HARMONIC pipeline (pure or hybrid mode).
+fn kouluta_kolmoset_harmonic(
+    teksti: &str,
+    koodikirja: &HashMap<char, Hypervektori>,
+    sitoja: &KontekstiSitoja,
+    hdc: &mut HdcPeruskäsitteet,
+    uudelleen: usize,
+    alpha_overrides: (Option<f64>, Option<f64>, Option<f64>, Option<f64>),
+    ulottuvuus: usize,
+    vaimennus: f64,
+    d18: bool,
+    hybrid: bool,
+) -> f64 {
+    let label = if hybrid { "Kolmoset+Harmonic+Keskus" } else { "Kolmoset+Harmonic" };
+    println!("\n  [{}] Building context vectors...", label);
+    let näytteet = rakenna_näytteet(teksti, koodikirja, sitoja, hdc);
+    println!("    Samples: {}", näytteet.len());
+
+    // Extract alphabet
+    let mut aakkosto: Vec<char> = näytteet.iter().map(|(_, c)| *c).collect();
+    aakkosto.sort();
+    aakkosto.dedup();
+    println!("    Alphabet: {} characters", aakkosto.len());
+
+    // Create triple relay
+    let n = näytteet.len();
+    let askeleet_a = n / 5;
+    let askeleet_b = n / 10;
+    let askeleet_c = n / 5;
+    println!("    Relay legs: A={}, B={}, C={}", askeleet_a, askeleet_b, askeleet_c);
+    let mut kolmoset = Kolmoset::new_custom(
+        &aakkosto, ulottuvuus, askeleet_a, askeleet_b, askeleet_c,
+    );
+    if vaimennus > 0.0 {
+        kolmoset.aseta_vaimennus(vaimennus);
+        println!("    Damping: ψ={:.6}", vaimennus);
+    }
+
+    // Create PhaseHarmonizer
+    let harmonizer = luo_harmonizer(aakkosto.len(), ulottuvuus, d18);
+
+    // Optional: create Keskus for hybrid mode
+    let teksti_lower: String = teksti.chars()
+        .map(|c| c.to_lowercase().next().unwrap_or(c))
+        .collect();
+    if hybrid {
+        println!("\n  [Keskus] Pre-training on corpus...");
+    }
+
+    // ── Single-pass Kolmoset training ───────────────────────────
+    println!("\n  [Kolmoset] Training (relay cascade)...");
+    let mut kaadot = 0usize;
+    for (konteksti, kohde) in &näytteet {
+        let tulos = kolmoset.kouluta_askel(konteksti, *kohde, hdc);
+        if tulos.kaato.is_some() {
+            kaadot += 1;
+        }
+    }
+    let tila = kolmoset.tila();
+    println!("    Online accuracy:     {:.2}% (during training)", tila.tarkkuus * 100.0);
+    println!("    Memory dumps:        {} relay transitions", kaadot);
+    println!("    ─── Node Details ───");
+    println!("    A (Source):  acc={:.1}%  trust={:.3}  cycles={}  steps={}",
+        tila.a_tarkkuus * 100.0, tila.a_luottamus, tila.a_kierrokset, tila.a_askeleet);
+    println!("    B (Bridge):  acc={:.1}%  trust={:.3}  cycles={}  steps={}",
+        tila.b_tarkkuus * 100.0, tila.b_luottamus, tila.b_kierrokset, tila.b_askeleet);
+    println!("    C (Target):  acc={:.1}%  trust={:.3}  cycles={}  steps={}",
+        tila.c_tarkkuus * 100.0, tila.c_luottamus, tila.c_kierrokset, tila.c_askeleet);
+
+    // ── Evaluate ─────────────────────────────────────────────────
+    let tarkkuus_raaka = arvioi_kolmoset(&kolmoset, &näytteet, hdc);
+    println!("\n  [Kolmoset] Raw ensemble accuracy:   {:.2}%", tarkkuus_raaka * 100.0);
+
+    let tarkkuus_harmonic;
+    if hybrid {
+        let mut keskus_eval = Keskus::new(&aakkosto, koodikirja.clone(), ulottuvuus);
+        sovella_alpha_yliajot(&mut keskus_eval, alpha_overrides);
+        keskus_eval.esikouluta(&teksti_lower);
+        println!("  [Keskus] Alphas: siirtymä={:.4} taajuus={:.4} kierto={:.4} sana={:.4}",
+            keskus_eval.alpha_siirtymä, keskus_eval.alpha_taajuus,
+            keskus_eval.alpha_kierto, keskus_eval.alpha_sana);
+
+        let mut harm_eval = harmonizer.clone();
+        harm_eval.reset_for_eval();
+        tarkkuus_harmonic = arvioi_kolmoset_harmonic_hybrid(
+            &kolmoset, &mut harm_eval, &mut keskus_eval, &näytteet, hdc, &aakkosto,
+        );
+        println!("  [Hybrid] Harmonic+Keskus accuracy:  {:.2}%  (Δ = {:+.2}%)",
+            tarkkuus_harmonic * 100.0, (tarkkuus_harmonic - tarkkuus_raaka) * 100.0);
+        tulosta_harmonic_diagnostiikka(&harm_eval);
+    } else {
+        let mut harm_eval = harmonizer.clone();
+        harm_eval.reset_for_eval();
+        tarkkuus_harmonic = arvioi_kolmoset_harmonic(
+            &kolmoset, &mut harm_eval, &näytteet, hdc, &aakkosto,
+        );
+        println!("  [Harmonic] Phase-lock accuracy:     {:.2}%  (Δ = {:+.2}%)",
+            tarkkuus_harmonic * 100.0, (tarkkuus_harmonic - tarkkuus_raaka) * 100.0);
+        tulosta_harmonic_diagnostiikka(&harm_eval);
+    }
+
+    // ── Retraining passes ──────────────────────────────────────
+    let mut paras = tarkkuus_harmonic;
+    for kierros in 1..=uudelleen {
+        println!("\n  [Kolmoset] Retraining pass {}...", kierros);
+        let tarkkuus_retrain = kolmoset.uudelleenkouluta(&näytteet, hdc, kierros);
+        let tarkkuus_raaka = arvioi_kolmoset(&kolmoset, &näytteet, hdc);
+        println!("    Retrain accuracy:   {:.2}%", tarkkuus_retrain * 100.0);
+        println!("    Raw ensemble:       {:.2}%", tarkkuus_raaka * 100.0);
+
+        let tarkkuus_h;
+        if hybrid {
+            let mut keskus_pass = Keskus::new(&aakkosto, koodikirja.clone(), ulottuvuus);
+            sovella_alpha_yliajot(&mut keskus_pass, alpha_overrides);
+            keskus_pass.esikouluta(&teksti_lower);
+            let mut harm_pass = harmonizer.clone();
+            harm_pass.reset_for_eval();
+            tarkkuus_h = arvioi_kolmoset_harmonic_hybrid(
+                &kolmoset, &mut harm_pass, &mut keskus_pass, &näytteet, hdc, &aakkosto,
+            );
+            println!("    Hybrid:             {:.2}%  (Δ = {:+.2}%)",
+                tarkkuus_h * 100.0, (tarkkuus_h - tarkkuus_raaka) * 100.0);
+        } else {
+            let mut harm_pass = harmonizer.clone();
+            harm_pass.reset_for_eval();
+            tarkkuus_h = arvioi_kolmoset_harmonic(
+                &kolmoset, &mut harm_pass, &näytteet, hdc, &aakkosto,
+            );
+            println!("    Harmonic:           {:.2}%  (Δ = {:+.2}%)",
+                tarkkuus_h * 100.0, (tarkkuus_h - tarkkuus_raaka) * 100.0);
+        }
+
+        if tarkkuus_h > paras {
+            paras = tarkkuus_h;
+        }
+    }
+
+    // ── Final ───────────────────────────────────────────────────
+    let loppu_raaka = arvioi_kolmoset(&kolmoset, &näytteet, hdc);
+    let loppu_h;
+    if hybrid {
+        let mut keskus_final = Keskus::new(&aakkosto, koodikirja.clone(), ulottuvuus);
+        sovella_alpha_yliajot(&mut keskus_final, alpha_overrides);
+        keskus_final.esikouluta(&teksti_lower);
+        let mut harm_final = harmonizer.clone();
+        harm_final.reset_for_eval();
+        loppu_h = arvioi_kolmoset_harmonic_hybrid(
+            &kolmoset, &mut harm_final, &mut keskus_final, &näytteet, hdc, &aakkosto,
+        );
+        tulosta_harmonic_diagnostiikka(&harm_final);
+    } else {
+        let mut harm_final = harmonizer.clone();
+        harm_final.reset_for_eval();
+        loppu_h = arvioi_kolmoset_harmonic(
+            &kolmoset, &mut harm_final, &näytteet, hdc, &aakkosto,
+        );
+        tulosta_harmonic_diagnostiikka(&harm_final);
+    }
+
+    println!("\n  [Final] Kolmoset raw:     {:.2}%", loppu_raaka * 100.0);
+    println!("  [Final] {}:  {:.2}%  (Δ = {:+.2}%)",
+        if hybrid { "Hybrid" } else { "Harmonic" },
+        loppu_h * 100.0, (loppu_h - loppu_raaka) * 100.0);
+    println!("  [Final] Peak:             {:.2}%", paras * 100.0);
+
+    loppu_h
+}
+
+/// KOLMOSET + HARMONIC COMPARE: 4-way comparison on each retrain pass.
+/// Raw ensemble vs Keskus vs PhaseHarmonic vs Hybrid
+fn kouluta_kolmoset_harmonic_compare(
+    teksti: &str,
+    koodikirja: &HashMap<char, Hypervektori>,
+    sitoja: &KontekstiSitoja,
+    hdc: &mut HdcPeruskäsitteet,
+    uudelleen: usize,
+    alpha_overrides: (Option<f64>, Option<f64>, Option<f64>, Option<f64>),
+    ulottuvuus: usize,
+    vaimennus: f64,
+    d18: bool,
+) -> f64 {
+    println!("\n  [Harmonic Compare] Building context vectors...");
+    let näytteet = rakenna_näytteet(teksti, koodikirja, sitoja, hdc);
+    println!("    Samples: {}", näytteet.len());
+
+    // Extract alphabet
+    let mut aakkosto: Vec<char> = näytteet.iter().map(|(_, c)| *c).collect();
+    aakkosto.sort();
+    aakkosto.dedup();
+    println!("    Alphabet: {} characters", aakkosto.len());
+
+    // Create triple relay
+    let n = näytteet.len();
+    let askeleet_a = n / 5;
+    let askeleet_b = n / 10;
+    let askeleet_c = n / 5;
+    println!("    Relay legs: A={}, B={}, C={}", askeleet_a, askeleet_b, askeleet_c);
+    let mut kolmoset = Kolmoset::new_custom(
+        &aakkosto, ulottuvuus, askeleet_a, askeleet_b, askeleet_c,
+    );
+    if vaimennus > 0.0 {
+        kolmoset.aseta_vaimennus(vaimennus);
+        println!("    Damping: ψ={:.6}", vaimennus);
+    }
+
+    // Create PhaseHarmonizer
+    let harmonizer = luo_harmonizer(aakkosto.len(), ulottuvuus, d18);
+
+    // Pre-train Keskus on corpus
+    let teksti_lower: String = teksti.chars()
+        .map(|c| c.to_lowercase().next().unwrap_or(c))
+        .collect();
+
+    {
+        let mut keskus_probe = Keskus::new(&aakkosto, koodikirja.clone(), ulottuvuus);
+        sovella_alpha_yliajot(&mut keskus_probe, alpha_overrides);
+        keskus_probe.esikouluta(&teksti_lower);
+        let kt = keskus_probe.tila();
+        println!("\n  [Keskus] Alphas: siirtymä={:.4} taajuus={:.4} kierto={:.4} sana={:.4}",
+            keskus_probe.alpha_siirtymä, keskus_probe.alpha_taajuus,
+            keskus_probe.alpha_kierto, keskus_probe.alpha_sana);
+        println!("    Transitions: {} observed", kt.siirtymä_näytteet);
+        println!("    Frequencies: {} observed", kt.taajuus_näytteet);
+    }
+
+    // ── Single-pass Kolmoset training ───────────────────────────
+    println!("\n  [Kolmoset] Training (relay cascade)...");
+    let mut kaadot = 0usize;
+    for (konteksti, kohde) in &näytteet {
+        let tulos = kolmoset.kouluta_askel(konteksti, *kohde, hdc);
+        if tulos.kaato.is_some() {
+            kaadot += 1;
+        }
+    }
+    let tila = kolmoset.tila();
+    println!("    Online accuracy:     {:.2}% (during training)", tila.tarkkuus * 100.0);
+    println!("    Memory dumps:        {} relay transitions", kaadot);
+    println!("    ─── Node Details ───");
+    println!("    A (Source):  acc={:.1}%  trust={:.3}  cycles={}  steps={}",
+        tila.a_tarkkuus * 100.0, tila.a_luottamus, tila.a_kierrokset, tila.a_askeleet);
+    println!("    B (Bridge):  acc={:.1}%  trust={:.3}  cycles={}  steps={}",
+        tila.b_tarkkuus * 100.0, tila.b_luottamus, tila.b_kierrokset, tila.b_askeleet);
+    println!("    C (Target):  acc={:.1}%  trust={:.3}  cycles={}  steps={}",
+        tila.c_tarkkuus * 100.0, tila.c_luottamus, tila.c_kierrokset, tila.c_askeleet);
+
+    // ── 4-way evaluation function ────────────────────────────────
+    let eval_4way = |kolmoset: &Kolmoset, label: &str| {
+        // 1. Raw
+        let raaka = arvioi_kolmoset(kolmoset, &näytteet, hdc);
+
+        // 2. Keskus
+        let mut keskus = Keskus::new(&aakkosto, koodikirja.clone(), ulottuvuus);
+        sovella_alpha_yliajot(&mut keskus, alpha_overrides);
+        keskus.esikouluta(&teksti_lower);
+        let keskus_acc = arvioi_kolmoset_keskus(kolmoset, &mut keskus, &näytteet, hdc);
+
+        // 3. PhaseHarmonic (pure)
+        let mut harm = harmonizer.clone();
+        harm.reset_for_eval();
+        let harmonic_acc = arvioi_kolmoset_harmonic(
+            kolmoset, &mut harm, &näytteet, hdc, &aakkosto,
+        );
+
+        // 4. Hybrid
+        let mut keskus_h = Keskus::new(&aakkosto, koodikirja.clone(), ulottuvuus);
+        sovella_alpha_yliajot(&mut keskus_h, alpha_overrides);
+        keskus_h.esikouluta(&teksti_lower);
+        let mut harm_h = harmonizer.clone();
+        harm_h.reset_for_eval();
+        let hybrid_acc = arvioi_kolmoset_harmonic_hybrid(
+            kolmoset, &mut harm_h, &mut keskus_h, &näytteet, hdc, &aakkosto,
+        );
+
+        println!("\n  ┌─── {} ───────────────────────────────────────────┐", label);
+        println!("  │ Raw Ensemble:   {:6.2}%                            │", raaka * 100.0);
+        println!("  │ Keskus:         {:6.2}%  (Δraw = {:+.2}%)            │",
+            keskus_acc * 100.0, (keskus_acc - raaka) * 100.0);
+        println!("  │ PhaseHarmonic:  {:6.2}%  (Δraw = {:+.2}%)            │",
+            harmonic_acc * 100.0, (harmonic_acc - raaka) * 100.0);
+        println!("  │ Hybrid:         {:6.2}%  (Δraw = {:+.2}%)            │",
+            hybrid_acc * 100.0, (hybrid_acc - raaka) * 100.0);
+        println!("  └────────────────────────────────────────────────────┘");
+
+        tulosta_harmonic_diagnostiikka(&harm);
+
+        (raaka, keskus_acc, harmonic_acc, hybrid_acc)
+    };
+
+    // ── Initial evaluation ─────────────────────────────────────
+    let (_, _, _, _) = eval_4way(&kolmoset, "Initial");
+
+    // ── Retraining passes ──────────────────────────────────────
+    let mut peak_raaka = 0.0_f64;
+    let mut peak_keskus = 0.0_f64;
+    let mut peak_harmonic = 0.0_f64;
+    let mut peak_hybrid = 0.0_f64;
+
+    for kierros in 1..=uudelleen {
+        println!("\n  [Kolmoset] Retraining pass {}...", kierros);
+        let tarkkuus_retrain = kolmoset.uudelleenkouluta(&näytteet, hdc, kierros);
+        println!("    Retrain accuracy: {:.2}%", tarkkuus_retrain * 100.0);
+
+        let (r, k, h, hy) = eval_4way(&kolmoset, &format!("Pass {}", kierros));
+        peak_raaka = peak_raaka.max(r);
+        peak_keskus = peak_keskus.max(k);
+        peak_harmonic = peak_harmonic.max(h);
+        peak_hybrid = peak_hybrid.max(hy);
+    }
+
+    // ── Final scoreboard ────────────────────────────────────────
+    let (final_r, final_k, final_h, final_hy) = eval_4way(&kolmoset, "FINAL");
+
+    peak_raaka = peak_raaka.max(final_r);
+    peak_keskus = peak_keskus.max(final_k);
+    peak_harmonic = peak_harmonic.max(final_h);
+    peak_hybrid = peak_hybrid.max(final_hy);
+
+    println!("\n  ╔═══════════════════════════════════════════════════════╗");
+    println!("  ║              PEAK SCOREBOARD                         ║");
+    println!("  ╠═══════════════════════════════════════════════════════╣");
+    println!("  ║ Raw Ensemble:   {:6.2}%                               ║", peak_raaka * 100.0);
+    println!("  ║ Keskus:         {:6.2}%  (Δraw = {:+.2}%)               ║",
+        peak_keskus * 100.0, (peak_keskus - peak_raaka) * 100.0);
+    println!("  ║ PhaseHarmonic:  {:6.2}%  (Δraw = {:+.2}%)               ║",
+        peak_harmonic * 100.0, (peak_harmonic - peak_raaka) * 100.0);
+    println!("  ║ Hybrid:         {:6.2}%  (Δraw = {:+.2}%)               ║",
+        peak_hybrid * 100.0, (peak_hybrid - peak_raaka) * 100.0);
+
+    // Highlight winner
+    let best = peak_raaka.max(peak_keskus).max(peak_harmonic).max(peak_hybrid);
+    let winner = if best == peak_hybrid { "Hybrid" }
+        else if best == peak_harmonic { "PhaseHarmonic" }
+        else if best == peak_keskus { "Keskus" }
+        else { "Raw Ensemble" };
+    println!("  ║                                                       ║");
+    println!("  ║ >>> Winner: {} at {:.2}%                        ║", winner, best * 100.0);
+    println!("  ╚═══════════════════════════════════════════════════════╝");
+
+    // Return the best result
+    best
 }
 
 // ═══════════════════════════════════════════════════════════════════════

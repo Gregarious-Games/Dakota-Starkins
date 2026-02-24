@@ -525,6 +525,36 @@ impl Kolmoset {
         pisteet
     }
 
+    /// Get per-relay score vectors as arrays indexed by alphabet position.
+    /// Each Vec<f64> has one element per character in self.aakkosto.
+    /// Scores are raw (Myöntö - beta*Kielto), NOT confidence-weighted or blended.
+    ///
+    /// Returns: [relay_a_scores, relay_b_scores, relay_c_scores]
+    /// where relay_X_scores[i] = score for self.aakkosto[i] from relay X.
+    pub fn per_relay_pisteet(
+        &self,
+        konteksti: &[f64],
+        hdc: &HdcPeruskäsitteet,
+    ) -> [Vec<f64>; 3] {
+        let n = self.aakkosto.len();
+        let mut scores_a = Vec::with_capacity(n);
+        let mut scores_b = Vec::with_capacity(n);
+        let mut scores_c = Vec::with_capacity(n);
+
+        for &c in &self.aakkosto {
+            scores_a.push(self.a.pisteet(konteksti, c, hdc));
+            scores_b.push(self.b.pisteet(konteksti, c, hdc));
+            scores_c.push(self.c.pisteet(konteksti, c, hdc));
+        }
+
+        [scores_a, scores_b, scores_c]
+    }
+
+    /// Access to the alphabet for index-to-char mapping.
+    pub fn aakkosto(&self) -> &[char] {
+        &self.aakkosto
+    }
+
     /// Relay retrain: cascade corrections through the relay.
     ///
     /// Instead of all three nodes retraining independently,

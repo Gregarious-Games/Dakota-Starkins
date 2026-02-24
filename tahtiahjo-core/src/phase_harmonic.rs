@@ -1170,8 +1170,12 @@ impl PhaseHarmonizer {
         }
     }
 
-    /// Log the state after a complete breath cycle
+    /// Log the state after a complete breath cycle.
+    /// Only prints if TAHTIAHJO_BREATH_LOG=1 environment variable is set.
     fn log_breath_cycle(&self) {
+        if std::env::var("TAHTIAHJO_BREATH_LOG").unwrap_or_default() != "1" {
+            return;
+        }
         let phi_dials = self.temporal.dial_in_phi_mode.iter().filter(|&&m| m).count();
         let sqrt3_dials = self.temporal.dial_in_phi_mode.len() - phi_dials;
 
@@ -1320,6 +1324,52 @@ impl PhaseHarmonizer {
                         && self.temporal.dial_in_phi_mode[i],
                 })
                 .collect(),
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // PIPELINE INTEGRATION
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// Record whether each dial's solo prediction was correct.
+    /// Updates each dial's accuracy history independently so dials
+    /// self-tune based on their own reliability, not the harmonizer's
+    /// final answer.
+    pub fn record_result(
+        &mut self,
+        model_scores: &[Vec<f64>],
+        actual_index: usize,
+    ) {
+        for (i, dial) in self.dials.iter_mut().enumerate() {
+            if i < model_scores.len() {
+                let dial_prediction = model_scores[i]
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| a.total_cmp(b))
+                    .map(|(idx, _)| idx)
+                    .unwrap_or(0);
+                dial.record_accuracy(dial_prediction == actual_index);
+            }
+        }
+    }
+
+    /// Reset mutable state for a fresh evaluation pass.
+    /// Keeps dial tuning parameters (temperature, weights, coupling
+    /// thresholds) but resets counters and prediction-dependent state.
+    pub fn reset_for_eval(&mut self) {
+        self.total_predictions = 0;
+        self.alignment_triggers = 0;
+        self.constructive_count = 0;
+        self.destructive_count = 0;
+        self.solo_fallback_count = 0;
+        self.breath_phase = 0;
+        self.breath_step = 0;
+        self.coherence_history.clear();
+        self.recent_alignments.clear();
+        let num_dials = self.dials.len();
+        self.temporal = TemporalPhaseTracker::new(num_dials, 200);
+        for dial in &mut self.dials {
+            dial.accuracy_history.clear();
         }
     }
 }
