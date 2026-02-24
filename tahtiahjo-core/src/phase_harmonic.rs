@@ -615,6 +615,20 @@ pub struct PhaseHarmonizer {
     /// High alignment → low temp (sharp). Low alignment → high temp (hedge).
     /// PhaseHarmonizer becomes a confidence modulator rather than a score replacer.
     pub alignment_temperature: bool,
+
+    // === Adaptive Temperature Learning ===
+    /// Temperature when dials strongly agree (low = sharp, confident)
+    pub temp_hot: f64,
+    /// Temperature when dials disagree (high = diffuse, hedging)
+    pub temp_cold: f64,
+    /// Rolling accuracy when alignment was constructive
+    pub aligned_correct: u64,
+    pub aligned_total: u64,
+    /// Rolling accuracy when no alignment / destructive
+    pub unaligned_correct: u64,
+    pub unaligned_total: u64,
+    /// Last prediction's alignment state (for record_result feedback)
+    pub last_was_aligned: bool,
 }
 
 impl PhaseHarmonizer {
@@ -671,6 +685,13 @@ impl PhaseHarmonizer {
             temporal: TemporalPhaseTracker::new(3, 200), // 3 dials, 200-step window
             blend_fallback: false,
             alignment_temperature: false,
+            temp_hot: 0.3,
+            temp_cold: 1.5,
+            aligned_correct: 0,
+            aligned_total: 0,
+            unaligned_correct: 0,
+            unaligned_total: 0,
+            last_was_aligned: false,
         }
     }
 
@@ -1026,28 +1047,26 @@ impl PhaseHarmonizer {
         }
 
         // Step B: Determine alignment-derived temperature
-        // alignment_strength ∈ [0, 1] → temperature ∈ [temp_hot, temp_cold]
-        // temp_hot = 0.3 (sharp when aligned) → confident picks
-        // temp_cold = 1.5 (diffuse when misaligned) → hedge bets
-        let temp_hot = 0.3;
-        let temp_cold = 1.5;
-
+        // Uses adaptive temp_hot/temp_cold (self-tuned in breathing exhale phase)
         let (align_temp, constructive) = if let Some(ref event) = alignment {
             self.alignment_triggers += 1;
             if event.constructive {
                 self.constructive_count += 1;
+                self.last_was_aligned = true;
                 // Strong constructive → very low temp (sharp)
-                let t = temp_cold - event.strength * (temp_cold - temp_hot);
+                let t = self.temp_cold - event.strength * (self.temp_cold - self.temp_hot);
                 (t, true)
             } else {
                 self.destructive_count += 1;
+                self.last_was_aligned = false;
                 // Destructive alignment → high temp (hedge)
-                (temp_cold, false)
+                (self.temp_cold, false)
             }
         } else {
             self.solo_fallback_count += 1;
-            // No alignment → moderate temp (baseline)
-            (1.0, false)
+            self.last_was_aligned = false;
+            // No alignment → moderate temp (geometric mean of hot and cold)
+            ((self.temp_hot * self.temp_cold).sqrt(), false)
         };
 
         // Step C: Apply softmax with alignment temperature
@@ -1249,6 +1268,42 @@ impl PhaseHarmonizer {
 
         // Tune coupling thresholds based on alignment success
         self.tune_coupling_thresholds();
+
+        // Adaptive temperature learning for align-temp mode
+        if self.alignment_temperature {
+            self.tune_alignment_temperatures();
+        }
+    }
+
+    /// Tune temp_hot and temp_cold based on aligned vs unaligned accuracy.
+    /// Inspired by quantum_collective's focus.rs temperature learning:
+    ///   temp = temp * (1-lr) + target * lr
+    fn tune_alignment_temperatures(&mut self) {
+        let lr = 0.02; // Learning rate (slow, stable)
+
+        // If we have enough aligned samples, tune temp_hot
+        if self.aligned_total > 50 {
+            let aligned_acc = self.aligned_correct as f64 / self.aligned_total as f64;
+            // High aligned accuracy → we can be sharper (lower temp_hot)
+            // Low aligned accuracy → need to hedge more (higher temp_hot)
+            // Target: temp_hot should be inversely proportional to aligned accuracy
+            let target_hot = 0.8 - 0.6 * aligned_acc; // acc=0.7 → 0.38, acc=0.5 → 0.50
+            let target_hot = target_hot.clamp(0.1, 0.8);
+            self.temp_hot = self.temp_hot * (1.0 - lr) + target_hot * lr;
+            self.temp_hot = self.temp_hot.clamp(0.1, 0.8);
+        }
+
+        // If we have enough unaligned samples, tune temp_cold
+        if self.unaligned_total > 50 {
+            let unaligned_acc = self.unaligned_correct as f64 / self.unaligned_total as f64;
+            // High unaligned accuracy → we're hedging too much (lower temp_cold)
+            // Low unaligned accuracy → hedging correctly (keep high temp_cold)
+            // Target: temp_cold should be inversely proportional to unaligned accuracy
+            let target_cold = 2.0 - 1.2 * unaligned_acc; // acc=0.4 → 1.52, acc=0.6 → 1.28
+            let target_cold = target_cold.clamp(0.8, 3.0);
+            self.temp_cold = self.temp_cold * (1.0 - lr) + target_cold * lr;
+            self.temp_cold = self.temp_cold.clamp(0.8, 3.0);
+        }
     }
 
     /// Rebalance dial weights based on recent accuracy
@@ -1488,6 +1543,7 @@ impl PhaseHarmonizer {
         model_scores: &[Vec<f64>],
         actual_index: usize,
     ) {
+        // Per-dial accuracy tracking
         for (i, dial) in self.dials.iter_mut().enumerate() {
             if i < model_scores.len() {
                 let dial_prediction = model_scores[i]
@@ -1497,6 +1553,37 @@ impl PhaseHarmonizer {
                     .map(|(idx, _)| idx)
                     .unwrap_or(0);
                 dial.record_accuracy(dial_prediction == actual_index);
+            }
+        }
+
+        // Track aligned vs unaligned accuracy for adaptive temp learning
+        if self.alignment_temperature {
+            // Reconstruct what the harmonizer predicted (same blend logic)
+            // Note: argmax is invariant to normalization, so we skip dividing by total_weight
+            let n = self.num_chars;
+            let mut combined = vec![0.0; n];
+            for (i, dial) in self.dials.iter().enumerate() {
+                if i >= model_scores.len() { break; }
+                let acc = dial.recent_accuracy(200).max(0.01);
+                let w = acc * dial.weight;
+                for c in 0..n {
+                    combined[c] += model_scores[i][c] * w;
+                }
+            }
+            let harmonizer_pred = combined
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.total_cmp(b))
+                .map(|(idx, _)| idx)
+                .unwrap_or(0);
+            let correct = harmonizer_pred == actual_index;
+
+            if self.last_was_aligned {
+                self.aligned_total += 1;
+                if correct { self.aligned_correct += 1; }
+            } else {
+                self.unaligned_total += 1;
+                if correct { self.unaligned_correct += 1; }
             }
         }
     }
@@ -1519,6 +1606,12 @@ impl PhaseHarmonizer {
         for dial in &mut self.dials {
             dial.accuracy_history.clear();
         }
+        // Reset adaptive temp counters but KEEP learned temp_hot/temp_cold
+        self.aligned_correct = 0;
+        self.aligned_total = 0;
+        self.unaligned_correct = 0;
+        self.unaligned_total = 0;
+        self.last_was_aligned = false;
     }
 
     /// Enable blend-fallback mode: when dials disagree, blend ALL dials

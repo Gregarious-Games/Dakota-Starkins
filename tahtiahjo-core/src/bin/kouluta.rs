@@ -1568,6 +1568,18 @@ fn tulosta_harmonic_diagnostiikka(harmonizer: &PhaseHarmonizer) {
         diag.breath_durations[0], diag.breath_durations[1],
         diag.breath_durations[2], diag.breath_durations[3],
         diag.phase_tolerance);
+    if harmonizer.alignment_temperature {
+        let aligned_acc = if harmonizer.aligned_total > 0 {
+            harmonizer.aligned_correct as f64 / harmonizer.aligned_total as f64
+        } else { 0.0 };
+        let unaligned_acc = if harmonizer.unaligned_total > 0 {
+            harmonizer.unaligned_correct as f64 / harmonizer.unaligned_total as f64
+        } else { 0.0 };
+        println!("    Temps: hot={:.3} cold={:.3}  Aligned acc: {:.1}% ({}/{})  Unaligned acc: {:.1}% ({}/{})",
+            harmonizer.temp_hot, harmonizer.temp_cold,
+            aligned_acc * 100.0, harmonizer.aligned_correct, harmonizer.aligned_total,
+            unaligned_acc * 100.0, harmonizer.unaligned_correct, harmonizer.unaligned_total);
+    }
     for ds in &diag.dial_states {
         println!("      [{}] δ={} T={:.2} w={:.3} acc={:.3} {}{}",
             ds.name, ds.delta, ds.temperature, ds.weight, ds.recent_accuracy,
