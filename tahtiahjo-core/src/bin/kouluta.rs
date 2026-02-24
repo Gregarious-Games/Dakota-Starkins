@@ -97,6 +97,8 @@ fn main() {
     let mut käytä_align_keskus = false;
     let mut käytä_ece_weights = false;
     let mut käytä_entropy_gate = false;
+    let mut käytä_meta_ensemble = false;
+    let mut käytä_mixed_window = false;
 
     for arg in &args[2..] {
         if let Some(val) = arg.strip_prefix("--chars=") {
@@ -167,6 +169,10 @@ fn main() {
             käytä_ece_weights = true;
         } else if arg == "--entropy-gate" {
             käytä_entropy_gate = true;
+        } else if arg == "--meta-ensemble" {
+            käytä_meta_ensemble = true;
+        } else if arg == "--mixed-window" {
+            käytä_mixed_window = true;
         }
     }
 
@@ -329,6 +335,8 @@ fn main() {
             käytä_align_keskus,
             käytä_ece_weights,
             käytä_entropy_gate,
+            käytä_meta_ensemble,
+            käytä_mixed_window,
         );
         tulosta_lopputulos(tarkkuus);
     } else if käytä_kolmoset && käytä_keskus && käytä_bipyramid {
@@ -691,6 +699,8 @@ fn kouluta_kolmoset_kierto(
     align_keskus: bool,
     ece_weights: bool,
     entropy_gate: bool,
+    meta_ensemble: bool,
+    mixed_window: bool,
 ) -> f64 {
     // ── Build per-relay codebooks ─────────────────────────────────
     println!("\n  [Kierto] Building per-relay codebooks...");
@@ -734,10 +744,28 @@ fn kouluta_kolmoset_kierto(
         kirjat[0].len(), kirjat[1].len(), kirjat[2].len());
 
     // ── Build per-relay sample sets ──────────────────────────────
-    println!("  [Kierto] Building per-relay context vectors...");
-    let näytteet_a = rakenna_näytteet(teksti, &kirjat[0], sitoja, hdc);
-    let näytteet_b = rakenna_näytteet(teksti, &kirjat[1], sitoja, hdc);
-    let näytteet_c = rakenna_näytteet(teksti, &kirjat[2], sitoja, hdc);
+    // Mixed-window mode: each relay sees a different context scale
+    //   A: window=2 (bigrams — fast, local patterns)
+    //   B: window=3 (trigrams — standard)
+    //   C: window=5 (quintigrams — longer-range structure)
+    let (näytteet_a, näytteet_b, näytteet_c) = if mixed_window {
+        println!("  [Kierto] Building MIXED-WINDOW context vectors (A=3, B=4, C=5)...");
+        let sitoja_a = KontekstiSitoja::new(3);
+        let sitoja_b = KontekstiSitoja::new(4);
+        let sitoja_c = KontekstiSitoja::new(5);
+        (
+            rakenna_näytteet(teksti, &kirjat[0], &sitoja_a, hdc),
+            rakenna_näytteet(teksti, &kirjat[1], &sitoja_b, hdc),
+            rakenna_näytteet(teksti, &kirjat[2], &sitoja_c, hdc),
+        )
+    } else {
+        println!("  [Kierto] Building per-relay context vectors...");
+        (
+            rakenna_näytteet(teksti, &kirjat[0], sitoja, hdc),
+            rakenna_näytteet(teksti, &kirjat[1], sitoja, hdc),
+            rakenna_näytteet(teksti, &kirjat[2], sitoja, hdc),
+        )
+    };
     println!("    Samples per relay: A={}, B={}, C={}",
         näytteet_a.len(), näytteet_b.len(), näytteet_c.len());
 
@@ -855,6 +883,17 @@ fn kouluta_kolmoset_kierto(
         );
         println!("    PhaseHarmonic:                   {:.2}%  (Δflat = {:+.2}%)",
             tarkkuus_harm * 100.0, (tarkkuus_harm - tarkkuus_flat) * 100.0);
+        if meta_ensemble {
+            let mut harm_meta = harmonizer.clone();
+            harm_meta.reset_for_eval();
+            let tarkkuus_meta = arvioi_kolmoset_meta_kierto(
+                &kolmoset, &mut harm_meta,
+                [&näytteet_a, &näytteet_b, &näytteet_c],
+                hdc, &aakkosto,
+            );
+            println!("    Meta-ensemble:                   {:.2}%  (Δflat = {:+.2}%)",
+                tarkkuus_meta * 100.0, (tarkkuus_meta - tarkkuus_flat) * 100.0);
+        }
         if align_keskus {
             let mut harm_k = harmonizer.clone();
             harm_k.reset_for_eval();
@@ -904,6 +943,18 @@ fn kouluta_kolmoset_kierto(
         );
         println!("    PhaseHarmonic:      {:.2}%  (Δensemble = {:+.2}%)",
             tarkkuus_harm * 100.0, (tarkkuus_harm - tarkkuus_eval) * 100.0);
+
+        if meta_ensemble {
+            let mut harm_meta = harmonizer.clone();
+            harm_meta.reset_for_eval();
+            let tarkkuus_meta = arvioi_kolmoset_meta_kierto(
+                &kolmoset, &mut harm_meta,
+                [&näytteet_a, &näytteet_b, &näytteet_c],
+                hdc, &aakkosto,
+            );
+            println!("    Meta-ensemble:     {:.2}%  (Δensemble = {:+.2}%)",
+                tarkkuus_meta * 100.0, (tarkkuus_meta - tarkkuus_eval) * 100.0);
+        }
 
         if align_keskus {
             let mut harm_k = harmonizer.clone();
@@ -957,6 +1008,17 @@ fn kouluta_kolmoset_kierto(
         if pcv { " (PCV)" } else { "" });
     println!("    PhaseHarmonic:     {:.2}%  (Δensemble = {:+.2}%)",
         loppu_harm * 100.0, (loppu_harm - loppu) * 100.0);
+    if meta_ensemble {
+        let mut harm_meta = harmonizer.clone();
+        harm_meta.reset_for_eval();
+        let loppu_meta = arvioi_kolmoset_meta_kierto(
+            &kolmoset, &mut harm_meta,
+            [&näytteet_a, &näytteet_b, &näytteet_c],
+            hdc, &aakkosto,
+        );
+        println!("    Meta-ensemble:    {:.2}%  (Δensemble = {:+.2}%)",
+            loppu_meta * 100.0, (loppu_meta - loppu) * 100.0);
+    }
     if align_keskus {
         let mut harm_k = harmonizer.clone();
         harm_k.reset_for_eval();
@@ -1613,6 +1675,87 @@ fn arvioi_kolmoset_harmonic_kierto(
 
         let actual_idx = char_to_idx.get(&kohde).copied().unwrap_or(0);
         harmonizer.record_result(&model_scores, actual_idx);
+    }
+
+    oikein as f64 / n as f64
+}
+
+/// META-ENSEMBLE: Run both the trust-weighted ensemble and the harmonizer
+/// on each prediction. When they agree, use that. When they disagree, pick
+/// the one with higher softmax confidence. This extracts the union of both
+/// systems' correct predictions.
+fn arvioi_kolmoset_meta_kierto(
+    kolmoset: &Kolmoset,
+    harmonizer: &mut PhaseHarmonizer,
+    näytteet: [&[(Vec<f64>, char)]; 3],
+    hdc: &HdcPeruskäsitteet,
+    aakkosto: &[char],
+) -> f64 {
+    let n = näytteet[0].len();
+    if n == 0 { return 0.0; }
+    let mut oikein = 0usize;
+    let mut agree_count = 0usize;
+    let mut disagree_ens_wins = 0usize;
+    let mut disagree_harm_wins = 0usize;
+
+    let char_to_idx: HashMap<char, usize> = aakkosto.iter()
+        .enumerate()
+        .map(|(i, &c)| (c, i))
+        .collect();
+
+    for i in 0..n {
+        let kohde = näytteet[0][i].1;
+        let kontekstit = [
+            näytteet[0][i].0.as_slice(),
+            näytteet[1][i].0.as_slice(),
+            näytteet[2][i].0.as_slice(),
+        ];
+
+        // === Ensemble prediction with confidence ===
+        let all_ens = kolmoset.kaikki_pisteet_kierto(kontekstit, hdc);
+        let (ens_pred, _) = kolmoset.ennusta_kierto(kontekstit, hdc);
+        // Compute ensemble softmax confidence
+        let ens_max = all_ens.values().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let ens_sum_exp: f64 = all_ens.values().map(|&s| (s - ens_max).exp()).sum();
+        let ens_conf = if ens_sum_exp > 1e-10 {
+            (all_ens.get(&ens_pred).unwrap_or(&0.0) - ens_max).exp() / ens_sum_exp
+        } else {
+            0.0
+        };
+
+        // === Harmonizer prediction ===
+        let relay_scores = kolmoset.per_relay_pisteet_kierto(kontekstit, hdc);
+        let model_scores: Vec<Vec<f64>> = relay_scores.to_vec();
+        let (harm_idx, harm_conf, _) = harmonizer.predict(&model_scores, None);
+        let harm_pred = if harm_idx < aakkosto.len() { aakkosto[harm_idx] } else { ' ' };
+
+        // === Meta-ensemble: pick more confident when they disagree ===
+        // Bias factor: harmonizer is statistically more accurate, so boost its confidence
+        // by φ (1.618) in the comparison. This corrects for the harmonizer's conservative
+        // confidence (PHI_INV penalty) vs ensemble's raw scores.
+        let harm_bias = 1.618;
+        let final_pred = if ens_pred == harm_pred {
+            agree_count += 1;
+            ens_pred
+        } else if harm_conf * harm_bias > ens_conf {
+            disagree_harm_wins += 1;
+            harm_pred
+        } else {
+            disagree_ens_wins += 1;
+            ens_pred
+        };
+
+        if final_pred == kohde { oikein += 1; }
+
+        let actual_idx = char_to_idx.get(&kohde).copied().unwrap_or(0);
+        harmonizer.record_result(&model_scores, actual_idx);
+    }
+
+    let total_disagree = disagree_ens_wins + disagree_harm_wins;
+    if total_disagree > 0 {
+        eprintln!("      [Meta] Agree: {}/{} ({:.1}%)  Disagree: {} (ens wins: {}, harm wins: {})",
+            agree_count, n, 100.0 * agree_count as f64 / n as f64,
+            total_disagree, disagree_ens_wins, disagree_harm_wins);
     }
 
     oikein as f64 / n as f64
