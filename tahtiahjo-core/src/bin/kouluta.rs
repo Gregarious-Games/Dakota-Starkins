@@ -801,6 +801,21 @@ fn kouluta_kolmoset_kierto(
     println!("    Per-relay diversity Δ:           {:+.2}%",
         (tarkkuus_alku - tarkkuus_flat) * 100.0);
 
+    // ── PhaseHarmonizer evaluation (per-relay diversity → phase-lock) ─
+    let harmonizer = luo_harmonizer(aakkosto.len(), ulottuvuus, false);
+    {
+        let mut harm_eval = harmonizer.clone();
+        harm_eval.reset_for_eval();
+        let tarkkuus_harm = arvioi_kolmoset_harmonic_kierto(
+            &kolmoset, &mut harm_eval,
+            [&näytteet_a, &näytteet_b, &näytteet_c],
+            hdc, &aakkosto,
+        );
+        println!("    PhaseHarmonic:                   {:.2}%  (Δflat = {:+.2}%)",
+            tarkkuus_harm * 100.0, (tarkkuus_harm - tarkkuus_flat) * 100.0);
+        tulosta_harmonic_diagnostiikka(&harm_eval);
+    }
+
     // ── Retraining passes with per-relay samples ─────────────────
     for kierros in 1..=uudelleen {
         println!("\n  [Kierto] Retraining pass {}...", kierros);
@@ -823,6 +838,17 @@ fn kouluta_kolmoset_kierto(
         );
         println!("    Retrain accuracy:   {:.2}%", tarkkuus * 100.0);
         println!("    Ensemble accuracy:  {:.2}%", tarkkuus_eval * 100.0);
+
+        // PhaseHarmonizer on retrained Kolmoset
+        let mut harm_pass = harmonizer.clone();
+        harm_pass.reset_for_eval();
+        let tarkkuus_harm = arvioi_kolmoset_harmonic_kierto(
+            &kolmoset, &mut harm_pass,
+            [&näytteet_a, &näytteet_b, &näytteet_c],
+            hdc, &aakkosto,
+        );
+        println!("    PhaseHarmonic:      {:.2}%  (Δensemble = {:+.2}%)",
+            tarkkuus_harm * 100.0, (tarkkuus_harm - tarkkuus_eval) * 100.0);
     }
 
     // ── PCV diagnostic after retraining ──────────────────────────
@@ -845,14 +871,26 @@ fn kouluta_kolmoset_kierto(
         hdc, pcv,
     );
     let loppu_flat = arvioi_kolmoset(&kolmoset, &näytteet_a, hdc);
+
+    let mut harm_final = harmonizer.clone();
+    harm_final.reset_for_eval();
+    let loppu_harm = arvioi_kolmoset_harmonic_kierto(
+        &kolmoset, &mut harm_final,
+        [&näytteet_a, &näytteet_b, &näytteet_c],
+        hdc, &aakkosto,
+    );
+
     let loppu_tila = kolmoset.tila();
     println!("\n  [Kierto] Final state:");
     println!("    A trust={:.3}  B trust={:.3}  C trust={:.3}",
         loppu_tila.a_luottamus, loppu_tila.b_luottamus, loppu_tila.c_luottamus);
     println!("    Per-relay accuracy: {:.2}%{}", loppu * 100.0,
         if pcv { " (PCV)" } else { "" });
+    println!("    PhaseHarmonic:     {:.2}%  (Δensemble = {:+.2}%)",
+        loppu_harm * 100.0, (loppu_harm - loppu) * 100.0);
     println!("    Flat baseline:     {:.2}%", loppu_flat * 100.0);
     println!("    Diversity Δ:       {:+.2}%", (loppu - loppu_flat) * 100.0);
+    tulosta_harmonic_diagnostiikka(&harm_final);
 
     loppu
 }
@@ -1446,6 +1484,56 @@ fn arvioi_kolmoset_harmonic_hybrid(
     }
 
     oikein as f64 / näytteet.len() as f64
+}
+
+/// Evaluate Kolmoset+PhaseHarmonizer with per-relay contexts (kierto pipeline).
+/// Each relay gets its own context vector from its own codebook.
+fn arvioi_kolmoset_harmonic_kierto(
+    kolmoset: &Kolmoset,
+    harmonizer: &mut PhaseHarmonizer,
+    näytteet: [&[(Vec<f64>, char)]; 3],
+    hdc: &HdcPeruskäsitteet,
+    aakkosto: &[char],
+) -> f64 {
+    let n = näytteet[0].len();
+    if n == 0 {
+        return 0.0;
+    }
+    let mut oikein = 0usize;
+
+    let char_to_idx: HashMap<char, usize> = aakkosto.iter()
+        .enumerate()
+        .map(|(i, &c)| (c, i))
+        .collect();
+
+    for i in 0..n {
+        let kohde = näytteet[0][i].1;
+        let kontekstit = [
+            näytteet[0][i].0.as_slice(),
+            näytteet[1][i].0.as_slice(),
+            näytteet[2][i].0.as_slice(),
+        ];
+
+        // Per-relay score vectors from per-relay contexts
+        let relay_scores = kolmoset.per_relay_pisteet_kierto(kontekstit, hdc);
+        let model_scores: Vec<Vec<f64>> = relay_scores.to_vec();
+        let (pred_idx, _confidence, _alignment) = harmonizer.predict(&model_scores, None);
+
+        let ennuste = if pred_idx < aakkosto.len() {
+            aakkosto[pred_idx]
+        } else {
+            ' '
+        };
+
+        if ennuste == kohde {
+            oikein += 1;
+        }
+
+        let actual_idx = char_to_idx.get(&kohde).copied().unwrap_or(0);
+        harmonizer.record_result(&model_scores, actual_idx);
+    }
+
+    oikein as f64 / n as f64
 }
 
 /// Print PhaseHarmonizer diagnostics.

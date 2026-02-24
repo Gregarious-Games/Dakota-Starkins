@@ -550,6 +550,27 @@ impl Kolmoset {
         [scores_a, scores_b, scores_c]
     }
 
+    /// Per-relay score vectors with per-relay contexts (kierto pipeline).
+    /// Each relay gets its own context vector (from its own codebook).
+    pub fn per_relay_pisteet_kierto(
+        &self,
+        kontekstit: [&[f64]; 3],
+        hdc: &HdcPeruskäsitteet,
+    ) -> [Vec<f64>; 3] {
+        let n = self.aakkosto.len();
+        let mut scores_a = Vec::with_capacity(n);
+        let mut scores_b = Vec::with_capacity(n);
+        let mut scores_c = Vec::with_capacity(n);
+
+        for &c in &self.aakkosto {
+            scores_a.push(self.a.pisteet(kontekstit[0], c, hdc));
+            scores_b.push(self.b.pisteet(kontekstit[1], c, hdc));
+            scores_c.push(self.c.pisteet(kontekstit[2], c, hdc));
+        }
+
+        [scores_a, scores_b, scores_c]
+    }
+
     /// Access to the alphabet for index-to-char mapping.
     pub fn aakkosto(&self) -> &[char] {
         &self.aakkosto
