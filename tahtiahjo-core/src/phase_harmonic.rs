@@ -605,6 +605,16 @@ pub struct PhaseHarmonizer {
     // === Temporal Phase (Rose's contribution) ===
     /// Tracks how phase patterns evolve over time windows
     pub temporal: TemporalPhaseTracker,
+
+    // === Blend Modes ===
+    /// When true, solo/destructive fallback blends ALL dials weighted by accuracy
+    /// instead of picking only the single best dial. Preserves ensemble information.
+    pub blend_fallback: bool,
+
+    /// When true, alignment strength modulates temperature over blended scores.
+    /// High alignment → low temp (sharp). Low alignment → high temp (hedge).
+    /// PhaseHarmonizer becomes a confidence modulator rather than a score replacer.
+    pub alignment_temperature: bool,
 }
 
 impl PhaseHarmonizer {
@@ -659,6 +669,8 @@ impl PhaseHarmonizer {
             destructive_count: 0,
             solo_fallback_count: 0,
             temporal: TemporalPhaseTracker::new(3, 200), // 3 dials, 200-step window
+            blend_fallback: false,
+            alignment_temperature: false,
         }
     }
 
@@ -707,7 +719,10 @@ impl PhaseHarmonizer {
         let alignment = self.detect_alignment(&dial_phases);
 
         // Step 3: Produce final prediction based on alignment result
-        let (prediction, confidence) = if let Some(ref event) = alignment {
+        let (prediction, confidence) = if self.alignment_temperature {
+            // RADICAL MODE: Alignment modulates temperature over blended scores
+            self.alignment_temp_prediction(&tempered_scores, &alignment)
+        } else if let Some(ref event) = alignment {
             self.alignment_triggers += 1;
             if event.constructive {
                 self.constructive_count += 1;
@@ -901,9 +916,14 @@ impl PhaseHarmonizer {
         self.solo_prediction(all_scores)
     }
 
-    /// Solo prediction: use the single most reliable dial
+    /// Solo prediction: use the single most reliable dial,
+    /// OR blend all dials weighted by accuracy when blend_fallback is enabled.
     fn solo_prediction(&self, all_scores: &[Vec<f64>]) -> (usize, f64) {
-        // Find the dial with the best recent track record
+        if self.blend_fallback {
+            return self.accuracy_weighted_blend(all_scores);
+        }
+
+        // Original: pick the single best dial
         let best_dial_idx = self
             .dials
             .iter()
@@ -931,6 +951,134 @@ impl PhaseHarmonizer {
         };
 
         (prediction, confidence * PHI_INV) // Reduce confidence when solo (no confirmation)
+    }
+
+    /// Blend ALL dials weighted by their recent accuracy.
+    /// Mirrors the ensemble's trust-weighted average but uses per-dial
+    /// accuracy as the weight instead of relay trust.
+    fn accuracy_weighted_blend(&self, all_scores: &[Vec<f64>]) -> (usize, f64) {
+        let n = self.num_chars;
+        let mut combined = vec![0.0; n];
+        let mut total_weight = 0.0;
+
+        for (i, dial) in self.dials.iter().enumerate() {
+            if i >= all_scores.len() { break; }
+            let acc = dial.recent_accuracy(200).max(0.01);
+            let w = acc * dial.weight;
+            total_weight += w;
+            for c in 0..n {
+                combined[c] += all_scores[i][c] * w;
+            }
+        }
+
+        if total_weight > 1e-10 {
+            for c in 0..n {
+                combined[c] /= total_weight;
+            }
+        }
+
+        let (prediction, max_score) = combined
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
+            .unwrap_or((0, &0.0));
+
+        let sum: f64 = combined.iter().sum();
+        let confidence = if sum > 1e-10 {
+            max_score / sum
+        } else {
+            0.0
+        };
+
+        // Still penalize slightly — no phase-lock confirmation — but less harshly
+        // than picking a single dial. Use sqrt(PHI_INV) ≈ 0.786 instead of PHI_INV ≈ 0.618
+        (prediction, confidence * PHI_INV.sqrt())
+    }
+
+    /// ALIGNMENT-TEMPERATURE MODE: Blend all dials weighted by accuracy (like ensemble),
+    /// then use alignment strength to modulate a final softmax temperature.
+    /// High alignment → low temp (sharp, confident) → amplifies winning char
+    /// Low/no alignment → high temp (hedge) → stays close to raw blend
+    /// This makes PhaseHarmonizer a confidence modulator, not a score replacer.
+    fn alignment_temp_prediction(
+        &mut self,
+        all_scores: &[Vec<f64>],
+        alignment: &Option<AlignmentEvent>,
+    ) -> (usize, f64) {
+        let n = self.num_chars;
+
+        // Step A: Accuracy-weighted blend of ALL dials (always use all information)
+        let mut combined = vec![0.0; n];
+        let mut total_weight = 0.0;
+        for (i, dial) in self.dials.iter().enumerate() {
+            if i >= all_scores.len() { break; }
+            let acc = dial.recent_accuracy(200).max(0.01);
+            let w = acc * dial.weight;
+            total_weight += w;
+            for c in 0..n {
+                combined[c] += all_scores[i][c] * w;
+            }
+        }
+        if total_weight > 1e-10 {
+            for c in 0..n {
+                combined[c] /= total_weight;
+            }
+        }
+
+        // Step B: Determine alignment-derived temperature
+        // alignment_strength ∈ [0, 1] → temperature ∈ [temp_hot, temp_cold]
+        // temp_hot = 0.3 (sharp when aligned) → confident picks
+        // temp_cold = 1.5 (diffuse when misaligned) → hedge bets
+        let temp_hot = 0.3;
+        let temp_cold = 1.5;
+
+        let (align_temp, constructive) = if let Some(ref event) = alignment {
+            self.alignment_triggers += 1;
+            if event.constructive {
+                self.constructive_count += 1;
+                // Strong constructive → very low temp (sharp)
+                let t = temp_cold - event.strength * (temp_cold - temp_hot);
+                (t, true)
+            } else {
+                self.destructive_count += 1;
+                // Destructive alignment → high temp (hedge)
+                (temp_cold, false)
+            }
+        } else {
+            self.solo_fallback_count += 1;
+            // No alignment → moderate temp (baseline)
+            (1.0, false)
+        };
+
+        // Step C: Apply softmax with alignment temperature
+        let max_score = combined.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let mut soft = vec![0.0; n];
+        let mut soft_sum = 0.0;
+        for c in 0..n {
+            soft[c] = ((combined[c] - max_score) / align_temp).exp();
+            soft_sum += soft[c];
+        }
+        if soft_sum > 1e-10 {
+            for c in 0..n {
+                soft[c] /= soft_sum;
+            }
+        }
+
+        let (prediction, max_prob) = soft
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
+            .unwrap_or((0, &0.0));
+
+        // Confidence: the softmax probability of the winning char
+        // Boost slightly when constructive alignment confirmed it
+        let confidence = if constructive {
+            max_prob.clamp(0.0, 1.0)
+        } else {
+            (max_prob * PHI_INV.sqrt()).clamp(0.0, 1.0)
+        };
+
+        (prediction, confidence)
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -1371,6 +1519,19 @@ impl PhaseHarmonizer {
         for dial in &mut self.dials {
             dial.accuracy_history.clear();
         }
+    }
+
+    /// Enable blend-fallback mode: when dials disagree, blend ALL dials
+    /// weighted by recent accuracy instead of picking a single best dial.
+    pub fn set_blend_fallback(&mut self, enabled: bool) {
+        self.blend_fallback = enabled;
+    }
+
+    /// Enable alignment-temperature mode: use alignment strength to modulate
+    /// temperature over accuracy-weighted blended scores.
+    /// High alignment → low temp (sharp). Low alignment → high temp (hedge).
+    pub fn set_alignment_temperature(&mut self, enabled: bool) {
+        self.alignment_temperature = enabled;
     }
 }
 

@@ -92,6 +92,8 @@ fn main() {
     let mut käytä_harmonic_hybrid = false;
     let mut käytä_harmonic_compare = false;
     let mut käytä_d18 = false;
+    let mut käytä_blend_fallback = false;
+    let mut käytä_align_temp = false;
 
     for arg in &args[2..] {
         if let Some(val) = arg.strip_prefix("--chars=") {
@@ -151,6 +153,10 @@ fn main() {
             käytä_harmonic_compare = true;
         } else if arg == "--d18" {
             käytä_d18 = true;
+        } else if arg == "--blend-fallback" {
+            käytä_blend_fallback = true;
+        } else if arg == "--align-temp" {
+            käytä_align_temp = true;
         }
     }
 
@@ -308,6 +314,8 @@ fn main() {
             käytä_qams_specialize,
             käytä_pcv,
             no_dump,
+            käytä_blend_fallback,
+            käytä_align_temp,
         );
         tulosta_lopputulos(tarkkuus);
     } else if käytä_kolmoset && käytä_keskus && käytä_bipyramid {
@@ -665,6 +673,8 @@ fn kouluta_kolmoset_kierto(
     qams_specialize: bool,
     pcv: bool,
     no_dump: bool,
+    blend_fallback: bool,
+    align_temp: bool,
 ) -> f64 {
     // ── Build per-relay codebooks ─────────────────────────────────
     println!("\n  [Kierto] Building per-relay codebooks...");
@@ -802,7 +812,15 @@ fn kouluta_kolmoset_kierto(
         (tarkkuus_alku - tarkkuus_flat) * 100.0);
 
     // ── PhaseHarmonizer evaluation (per-relay diversity → phase-lock) ─
-    let harmonizer = luo_harmonizer(aakkosto.len(), ulottuvuus, false);
+    let mut harmonizer = luo_harmonizer(aakkosto.len(), ulottuvuus, false);
+    if blend_fallback {
+        harmonizer.set_blend_fallback(true);
+        println!("    [PhaseHarmonic] Blend-fallback mode: ON");
+    }
+    if align_temp {
+        harmonizer.set_alignment_temperature(true);
+        println!("    [PhaseHarmonic] Alignment-temperature mode: ON");
+    }
     {
         let mut harm_eval = harmonizer.clone();
         harm_eval.reset_for_eval();
