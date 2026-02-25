@@ -16,3 +16,7 @@ pub mod kolmoset;
 pub mod keskus;
 pub mod kaksoisnapainen;
 pub mod phase_harmonic;
+pub mod ternaari;
+pub mod kolmiydin;
+pub mod kuningatar;
+pub mod kolmiaisti;

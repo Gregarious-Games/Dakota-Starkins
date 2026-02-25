@@ -40,6 +40,11 @@ use tahtiahjo_core::kolmoset::Kolmoset;
 use tahtiahjo_core::keskus::Keskus;
 use tahtiahjo_core::kaksoisnapainen::KaksoisnapainenKartta;
 use tahtiahjo_core::phase_harmonic::PhaseHarmonizer;
+use tahtiahjo_core::ternaari::{
+    kvantisoi, kvantisoi_prototyypit, ennusta_ternaari,
+    TernääriReleSolmu,
+};
+use tahtiahjo_core::kolmiaisti::KolmiAisti;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -100,6 +105,8 @@ fn main() {
     let mut käytä_meta_ensemble = false;
     let mut käytä_mixed_window = false;
     let mut mixed_windows: (usize, usize, usize) = (3, 4, 5);
+    let mut käytä_ternary = false;
+    let mut käytä_triadic = false;
 
     for arg in &args[2..] {
         if let Some(val) = arg.strip_prefix("--chars=") {
@@ -184,6 +191,10 @@ fn main() {
                     parts[2].parse().unwrap_or(5),
                 );
             }
+        } else if arg == "--ternary" {
+            käytä_ternary = true;
+        } else if arg == "--triadic" {
+            käytä_triadic = true;
         }
     }
 
@@ -207,7 +218,13 @@ fn main() {
     if vaimennus > 0.0 {
         println!("  Damping:    ψ={:.6} (golden-mean drift brake)", vaimennus);
     }
-    if vertaa {
+    if käytä_triadic {
+        println!("  Mode:       TRIADIC CORE (3 engines × 3 relays = 9 nodes)");
+        println!("  Engines:    α(3/5/7) β(5/9/13) γ(9/15/21)");
+        if käytä_ternary {
+            println!("  Ternary:    ON (post-training quantization)");
+        }
+    } else if vertaa {
         println!("  Mode:       COMPARE (all architectures)");
     } else if käytä_kolmoset && käytä_harmonic_compare {
         println!("  Mode:       KOLMOSET + HARMONIC COMPARE (4-way: raw/keskus/harmonic/hybrid)");
@@ -245,6 +262,9 @@ fn main() {
     } else {
         println!("  Mode:       STANDARD (LuokkaKertymä)");
     }
+    if käytä_ternary && !käytä_triadic {
+        println!("  Ternary:    ON (post-training quantization eval)");
+    }
     println!("───────────────────────────────────────────────────────────────");
 
     // Build codebook
@@ -269,7 +289,15 @@ fn main() {
     let mut hdc = HdcPeruskäsitteet::new(ulottuvuus, 42);
     let sitoja = KontekstiSitoja::new(ikkuna);
 
-    if vertaa {
+    if käytä_triadic {
+        // ═══════════════════════════════════════════════════════════════
+        // TRIADIC CORE: 3 engines × 3 relays = 9 nodes + Queen Mesh
+        // ═══════════════════════════════════════════════════════════════
+        let tarkkuus = kouluta_triadic(
+            &teksti, &mut hdc, uudelleen, ulottuvuus, käytä_ternary,
+        );
+        tulosta_lopputulos(tarkkuus);
+    } else if vertaa {
         // ═══════════════════════════════════════════════════════════════
         // COMPARE MODE: run all architectures side-by-side
         // ═══════════════════════════════════════════════════════════════
@@ -350,6 +378,12 @@ fn main() {
             käytä_mixed_window,
             mixed_windows,
         );
+        if käytä_ternary {
+            arvioi_ternary_kierto(
+                &teksti, &allekirjoitukset, &koodikirja, &sitoja, &mut hdc,
+                ulottuvuus, käytä_qams_specialize, käytä_mixed_window, mixed_windows,
+            );
+        }
         tulosta_lopputulos(tarkkuus);
     } else if käytä_kolmoset && käytä_keskus && käytä_bipyramid {
         // ═══════════════════════════════════════════════════════════════
@@ -2252,6 +2286,294 @@ fn kouluta_kolmoset_harmonic_compare(
 
     // Return the best result
     best
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// TRIADIC CORE PIPELINE — 3 engines × 3 relays + Queen Mesh
+// ═══════════════════════════════════════════════════════════════════════
+
+fn kouluta_triadic(
+    teksti: &str,
+    hdc: &mut HdcPeruskäsitteet,
+    uudelleen: usize,
+    ulottuvuus: usize,
+    ternary: bool,
+) -> f64 {
+    let allekirjoitukset = kaikki_allekirjoitukset();
+
+    // Lowercase text characters
+    let merkit: Vec<char> = teksti.chars()
+        .map(|c| c.to_lowercase().next().unwrap_or(c))
+        .collect();
+
+    // Extract alphabet
+    let mut aakkosto: Vec<char> = merkit.clone();
+    aakkosto.sort();
+    aakkosto.dedup();
+    println!("    Alphabet: {} characters", aakkosto.len());
+
+    // ── Create triadic system ──────────────────────────────────────
+    println!("\n  [Kolmiaisti] Creating three-engine triadic core...");
+    let mut system = KolmiAisti::new(
+        &aakkosto, ulottuvuus, &allekirjoitukset, &merkit,
+    );
+    println!("    α (Language):  windows {}/{}/{}  seed=42",
+        system.alpha.profiili.ikkunat.0,
+        system.alpha.profiili.ikkunat.1,
+        system.alpha.profiili.ikkunat.2,
+    );
+    println!("    β (Phonetic):  windows {}/{}/{}  seed=1042",
+        system.beta.profiili.ikkunat.0,
+        system.beta.profiili.ikkunat.1,
+        system.beta.profiili.ikkunat.2,
+    );
+    println!("    γ (Temporal):  windows {}/{}/{}  seed=2042",
+        system.gamma.profiili.ikkunat.0,
+        system.gamma.profiili.ikkunat.1,
+        system.gamma.profiili.ikkunat.2,
+    );
+
+    // ── Build sample sets (9 total) ─────────────────────────────
+    println!("\n  [Kolmiaisti] Building 9 sample sets (3 engines × 3 relays)...");
+    let näytteet = system.rakenna_näytteet(&merkit, hdc);
+    println!("    α samples: A={}, B={}, C={}",
+        näytteet.alpha[0].len(), näytteet.alpha[1].len(), näytteet.alpha[2].len());
+    println!("    β samples: A={}, B={}, C={}",
+        näytteet.beta[0].len(), näytteet.beta[1].len(), näytteet.beta[2].len());
+    println!("    γ samples: A={}, B={}, C={}",
+        näytteet.gamma[0].len(), näytteet.gamma[1].len(), näytteet.gamma[2].len());
+
+    // ── Train all 3 engines (no-dump, independent) ───────────────
+    println!("\n  [Kolmiaisti] Training (no-dump, independent)...");
+    system.kouluta(&näytteet, hdc);
+
+    // ── Initial evaluation ────────────────────────────────────────
+    let per_engine = system.arvioi_per_engine(&näytteet, hdc);
+    let (combined_acc, diag) = system.arvioi(&näytteet, hdc);
+    println!("\n  [Kolmiaisti] Initial evaluation:");
+    system.tulosta_diagnostiikka(per_engine, &diag, combined_acc);
+
+    // ── Retrain loop ──────────────────────────────────────────────
+    let mut paras_combined = combined_acc;
+    for kierros in 1..=uudelleen {
+        println!("\n  [Kolmiaisti] Retraining pass {}...", kierros);
+        let retrain_accs = system.uudelleenkouluta(&näytteet, hdc, kierros);
+        println!("    Retrain accuracy: α={:.2}%  β={:.2}%  γ={:.2}%",
+            retrain_accs[0] * 100.0, retrain_accs[1] * 100.0, retrain_accs[2] * 100.0);
+
+        let per_engine = system.arvioi_per_engine(&näytteet, hdc);
+        let (combined_acc, diag) = system.arvioi(&näytteet, hdc);
+        system.tulosta_diagnostiikka(per_engine, &diag, combined_acc);
+
+        if combined_acc > paras_combined {
+            paras_combined = combined_acc;
+        }
+    }
+
+    // ── Ternary quantization (if requested) ───────────────────────
+    if ternary {
+        println!("\n  ═══════════════════════════════════════════════════════");
+        println!("  [Ternary] Post-training quantization...");
+        println!("  ═══════════════════════════════════════════════════════");
+
+        let kynnys = 0.7635; // FAMILY_BOUNDARY
+
+        // Quantize all relay prototypes across all 3 engines
+        let engines = [&system.alpha, &system.beta, &system.gamma];
+        let engine_names = ["α", "β", "γ"];
+
+        let mut total_f64_bytes = 0usize;
+        let mut total_ternary_bytes = 0usize;
+
+        for (eng_idx, engine) in engines.iter().enumerate() {
+            let relays = [&engine.kolmoset.a, &engine.kolmoset.b, &engine.kolmoset.c];
+            let relay_names = ["A", "B", "C"];
+
+            for (r_idx, relay) in relays.iter().enumerate() {
+                let t_relay = TernääriReleSolmu::from_rele(relay, kynnys);
+
+                let n_chars = relay.myöntö.prototyypit.len();
+                let dim = if let Some(v) = relay.myöntö.prototyypit.values().next() {
+                    v.len()
+                } else { 0 };
+
+                let f64_bytes = n_chars * dim * 8 * 2; // myöntö + kielto
+                let t_bytes = t_relay.memory_bytes();
+                let sparsity = t_relay.avg_sparsity();
+
+                total_f64_bytes += f64_bytes;
+                total_ternary_bytes += t_bytes;
+
+                println!("    {} relay {}: f64={} B → ternary={} B  ({:.1}x compression, {:.1}% sparse)",
+                    engine_names[eng_idx], relay_names[r_idx],
+                    f64_bytes, t_bytes,
+                    if t_bytes > 0 { f64_bytes as f64 / t_bytes as f64 } else { 0.0 },
+                    sparsity * 100.0,
+                );
+            }
+        }
+
+        println!("\n    Total: f64={} B ({:.1} KB) → ternary={} B ({:.1} KB)  ({:.1}x)",
+            total_f64_bytes, total_f64_bytes as f64 / 1024.0,
+            total_ternary_bytes, total_ternary_bytes as f64 / 1024.0,
+            if total_ternary_bytes > 0 { total_f64_bytes as f64 / total_ternary_bytes as f64 } else { 0.0 },
+        );
+
+        // Ternary evaluation: quantize each engine and evaluate
+        // (simplified: quantize top-relay prototypes and compare predictions)
+        println!("\n    [Ternary] Quantizing and evaluating top relay per engine...");
+        for (eng_idx, engine) in engines.iter().enumerate() {
+            // Quantize relay C (target — most refined) prototypes
+            let relay_c = &engine.kolmoset.c;
+            let t_myöntö = kvantisoi_prototyypit(&relay_c.myöntö.prototyypit, kynnys);
+
+            // Evaluate ternary predictions on relay A's samples (same targets)
+            let samples = &näytteet.alpha[0]; // Use alpha as baseline for comparison
+            if eng_idx == 0 {
+                let mut oikein = 0usize;
+                for (ctx_f64, kohde) in samples.iter() {
+                    let ctx_t = kvantisoi(ctx_f64, kynnys);
+                    let (pred, _) = ennusta_ternaari(&ctx_t, &t_myöntö);
+                    if pred == *kohde { oikein += 1; }
+                }
+                let acc = if samples.is_empty() { 0.0 } else { oikein as f64 / samples.len() as f64 };
+                println!("    {} ternary accuracy (relay C only): {:.2}%", engine_names[eng_idx], acc * 100.0);
+            }
+        }
+    }
+
+    // ── Final ─────────────────────────────────────────────────────
+    let per_engine_final = system.arvioi_per_engine(&näytteet, hdc);
+    let (loppu, diag_final) = system.arvioi(&näytteet, hdc);
+
+    println!("\n  ╔═══════════════════════════════════════════════════════╗");
+    println!("  ║          TRIADIC CORE FINAL RESULTS                  ║");
+    println!("  ╠═══════════════════════════════════════════════════════╣");
+    println!("  ║ α (Language):  {:.2}%                                 ║", per_engine_final[0] * 100.0);
+    println!("  ║ β (Phonetic):  {:.2}%                                 ║", per_engine_final[1] * 100.0);
+    println!("  ║ γ (Temporal):  {:.2}%                                 ║", per_engine_final[2] * 100.0);
+    println!("  ║ Queen Mesh:    {:.2}%  (coherence={:.3}, mode={})    ║",
+        loppu * 100.0, diag_final.koherenssi, diag_final.tila);
+    println!("  ║ Peak:          {:.2}%                                 ║", paras_combined.max(loppu) * 100.0);
+    let best_single = per_engine_final[0].max(per_engine_final[1]).max(per_engine_final[2]);
+    let mesh_delta = loppu - best_single;
+    println!("  ║ Mesh Δ:        {:+.2}% vs best single engine         ║", mesh_delta * 100.0);
+    println!("  ╚═══════════════════════════════════════════════════════╝");
+
+    loppu
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// TERNARY EVALUATION — Post-training quantization for kierto pipeline
+// ═══════════════════════════════════════════════════════════════════════
+
+fn arvioi_ternary_kierto(
+    teksti: &str,
+    allekirjoitukset: &HashMap<char, ÄänneAllekirjoitus>,
+    koodikirja_oletus: &HashMap<char, Hypervektori>,
+    sitoja: &KontekstiSitoja,
+    hdc: &mut HdcPeruskäsitteet,
+    ulottuvuus: usize,
+    qams_specialize: bool,
+    mixed_window: bool,
+    mixed_window_sizes: (usize, usize, usize),
+) {
+    println!("\n  ═══════════════════════════════════════════════════════");
+    println!("  [Ternary] Post-training quantization evaluation...");
+    println!("  ═══════════════════════════════════════════════════════");
+
+    let kynnys = 0.7635; // FAMILY_BOUNDARY
+
+    // Build codebooks (same as kierto pipeline)
+    let mut kirjat: [HashMap<char, Hypervektori>; 3] = [
+        koodikirja_oletus.clone(),
+        koodikirja_oletus.clone(),
+        koodikirja_oletus.clone(),
+    ];
+    if qams_specialize {
+        kirjat[0] = luo_koodikirja_painotettu(allekirjoitukset, ulottuvuus, 42, &PAINOT_RELE_A);
+        kirjat[1] = luo_koodikirja_painotettu(allekirjoitukset, ulottuvuus, 42, &PAINOT_RELE_B);
+        kirjat[2] = luo_koodikirja_painotettu(allekirjoitukset, ulottuvuus, 42, &PAINOT_RELE_C);
+        let mut rng = tahtiahjo_core::hdc_primitives::Siemen::new(777);
+        for c in teksti.chars() {
+            let c_lower = c.to_lowercase().next().unwrap_or(c);
+            for kirja in kirjat.iter_mut() {
+                kirja.entry(c_lower)
+                    .or_insert_with(|| rng.bipolaarinen_vektori(ulottuvuus));
+            }
+        }
+    }
+
+    // Build samples (same as kierto)
+    let (näytteet_a, _näytteet_b, _näytteet_c) = if mixed_window {
+        let (wa, wb, wc) = mixed_window_sizes;
+        let sitoja_a = KontekstiSitoja::new(wa);
+        let sitoja_b = KontekstiSitoja::new(wb);
+        let sitoja_c = KontekstiSitoja::new(wc);
+        (
+            rakenna_näytteet(teksti, &kirjat[0], &sitoja_a, hdc),
+            rakenna_näytteet(teksti, &kirjat[1], &sitoja_b, hdc),
+            rakenna_näytteet(teksti, &kirjat[2], &sitoja_c, hdc),
+        )
+    } else {
+        (
+            rakenna_näytteet(teksti, &kirjat[0], sitoja, hdc),
+            rakenna_näytteet(teksti, &kirjat[1], sitoja, hdc),
+            rakenna_näytteet(teksti, &kirjat[2], sitoja, hdc),
+        )
+    };
+
+    // Train a Kolmoset on relay A samples (quick training for ternary comparison)
+    let mut aakkosto: Vec<char> = näytteet_a.iter().map(|(_, c)| *c).collect();
+    aakkosto.sort();
+    aakkosto.dedup();
+
+    let n = näytteet_a.len();
+    let askeleet_a = n / 5;
+    let askeleet_b = n / 10;
+    let askeleet_c = n / 5;
+    let mut kolmoset = Kolmoset::new_custom(
+        &aakkosto, ulottuvuus, askeleet_a, askeleet_b, askeleet_c,
+    );
+
+    // Quick single-pass training on relay A samples
+    for (konteksti, kohde) in &näytteet_a {
+        kolmoset.kouluta_askel(konteksti, *kohde, hdc);
+    }
+
+    // F64 baseline
+    let f64_acc = arvioi_kolmoset(&kolmoset, &näytteet_a, hdc);
+    println!("    f64 accuracy:      {:.2}%", f64_acc * 100.0);
+
+    // Quantize prototypes
+    let t_relay_a = TernääriReleSolmu::from_rele(&kolmoset.a, kynnys);
+    let t_relay_b = TernääriReleSolmu::from_rele(&kolmoset.b, kynnys);
+    let t_relay_c = TernääriReleSolmu::from_rele(&kolmoset.c, kynnys);
+
+    // Ternary evaluation (using relay C — most mature — for simplicity)
+    let mut oikein = 0usize;
+    for (ctx_f64, kohde) in &näytteet_a {
+        let ctx_t = kvantisoi(ctx_f64, kynnys);
+        let (pred, _) = t_relay_c.ennusta(&ctx_t);
+        if pred == *kohde { oikein += 1; }
+    }
+    let ternary_acc = if n > 0 { oikein as f64 / n as f64 } else { 0.0 };
+    println!("    Ternary accuracy:  {:.2}%  (relay C)", ternary_acc * 100.0);
+    println!("    Accuracy loss:     {:.2}%", (f64_acc - ternary_acc) * 100.0);
+
+    // Memory stats
+    let f64_bytes = kolmoset.a.myöntö.prototyypit.len() * ulottuvuus * 8 * 6; // 3 relays × (myöntö+kielto)
+    let t_bytes = t_relay_a.memory_bytes() + t_relay_b.memory_bytes() + t_relay_c.memory_bytes();
+    println!("    Memory: f64={:.1} KB → ternary={:.1} KB  ({:.1}x compression)",
+        f64_bytes as f64 / 1024.0,
+        t_bytes as f64 / 1024.0,
+        if t_bytes > 0 { f64_bytes as f64 / t_bytes as f64 } else { 0.0 },
+    );
+    println!("    Sparsity: A={:.1}%  B={:.1}%  C={:.1}%",
+        t_relay_a.avg_sparsity() * 100.0,
+        t_relay_b.avg_sparsity() * 100.0,
+        t_relay_c.avg_sparsity() * 100.0,
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════
